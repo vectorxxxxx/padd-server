@@ -1,7 +1,56 @@
 import "dotenv/config";
 import express, { NextFunction, type Request, Response } from "express";
+import fs from "fs";
+import path from "path";
 import { registerRoutes } from "./routes";
 import { log, serveStatic, setupVite } from "./vite";
+
+// If a service account JSON is provided via environment, write it to
+// `serviceacc.json` in the current working directory and set
+// `GOOGLE_APPLICATION_CREDENTIALS` so Google SDKs pick it up.
+// Supported env names (checked in order):
+// - SERVICE_ACCOUNT_BASE64 (base64-encoded JSON)
+// - SERVICEACC_B64
+// - SERVICE_JSON_B64
+// - SERVICE_ACCOUNT_JSON (raw JSON string)
+try {
+  const candidates = [
+    process.env.SERVICE_ACCOUNT_BASE64,
+    process.env.SERVICEACC_B64,
+    process.env.SERVICE_JSON_B64,
+    process.env.SERVICE_ACCOUNT_JSON,
+  ];
+
+  const found = candidates.find((v) => typeof v === "string" && v.trim().length > 0);
+  if (found) {
+    const outPath = path.resolve(process.cwd(), "serviceacc.json");
+
+    // Heuristics: if it starts with '{' it's raw JSON, otherwise try base64 decode.
+    let content: string;
+    const trimmed = found.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      content = trimmed;
+    } else {
+      // Try to decode as base64. If decoding fails or the result is not JSON,
+      // fall back to writing the original string to aid debugging.
+      try {
+        const decoded = Buffer.from(trimmed, "base64").toString("utf8");
+        // quick JSON sanity check
+        JSON.parse(decoded);
+        content = decoded;
+      } catch (err) {
+        console.warn("SERVICE_ACCOUNT env value doesn't look like JSON and base64 decode failed — writing raw value for inspection");
+        content = trimmed;
+      }
+    }
+
+    fs.writeFileSync(outPath, content, { encoding: "utf8", mode: 0o600 });
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = outPath;
+    console.log("Wrote service account JSON from env to:", outPath);
+  }
+} catch (err) {
+  console.error("Failed to write service account JSON from env:", err);
+}
 
 const serverOnlyMode = process.env.SERVER_ONLY === "true";
 const app = express();
