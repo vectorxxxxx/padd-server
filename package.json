@@ -1,0 +1,36 @@
+{
+    "name": "slab-server-standalone",
+    "version": "0.1.0",
+    "type": "module",
+    "license": "MIT",
+    "scripts": {
+        "dev": "cross-env NODE_ENV=development tsx index.ts",
+        "start": "NODE_ENV=production node dist/index.js",
+        "build": "esbuild index.ts --platform=node --bundle --format=esm --outdir=dist --external:lightningcss",
+        "test": "vitest"
+    },
+    "dependencies": {
+        "@bundlr-network/client": "^0.11.17",
+        "@solana/web3.js": "^1.98.4",
+        "bignumber.js": "^9.3.1",
+        "bs58": "^6.0.0",
+        "dotenv": "^17.2.3",
+        "express": "^4.21.2",
+        "express-session": "^1.18.1",
+        "firebase-admin": "^13.6.0",
+        "nanoid": "^4.0.2",
+        "passport": "^0.7.0",
+        "passport-local": "^1.0.0",
+        "puppeteer": "^24.29.1",
+        "zod": "^4.1.12"
+    },
+    "devDependencies": {
+        "cross-env": "^10.1.0",
+        "esbuild": "^0.25.0",
+        "lightningcss": "^1.30.2",
+        "tsx": "^4.20.5",
+        "typescript": "5.6.3",
+        "vite": "^5.4.20",
+        "vitest": "^1.1.6"
+    }
+}
