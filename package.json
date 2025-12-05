@@ -5,8 +5,8 @@
     "license": "MIT",
     "scripts": {
         "dev": "cross-env NODE_ENV=development tsx index.ts",
-        "start": "NODE_ENV=production node dist/index.js",
-        "build": "esbuild index.ts --platform=node --bundle --format=cjs --outdir=dist --external:lightningcss",
+        "start": "NODE_ENV=production node dist/index.cjs",
+        "build": "esbuild index.ts --platform=node --bundle --format=cjs --outdir=dist --out-extension:.js=.cjs --external:lightningcss",
         "test": "vitest"
     },
     "dependencies": {
