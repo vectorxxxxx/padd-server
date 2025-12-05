@@ -5,8 +5,8 @@
     "license": "MIT",
     "scripts": {
         "dev": "cross-env NODE_ENV=development tsx index.ts",
-        "start": "NODE_ENV=production node dist/index.cjs",
-        "build": "esbuild index.ts --platform=node --bundle --format=cjs --outdir=dist --out-extension:.js=.cjs --external:lightningcss",
+        "start": "cross-env NODE_ENV=production tsx index.ts",
+        "build": "esbuild index.ts --platform=node --bundle --format=esm --outdir=dist --out-extension:.js=.mjs --external:lightningcss --external:vite --external:dotenv",
         "test": "vitest"
     },
     "dependencies": {
@@ -22,13 +22,13 @@
         "passport": "^0.7.0",
         "passport-local": "^1.0.0",
         "puppeteer": "^24.29.1",
+        "tsx": "^4.21.0",
+        "cross-env": "^10.1.0",
         "zod": "^4.1.12"
     },
     "devDependencies": {
-        "cross-env": "^10.1.0",
         "esbuild": "^0.25.0",
         "lightningcss": "^1.30.2",
-        "tsx": "^4.20.5",
         "typescript": "5.6.3",
         "vite": "^5.4.20",
         "vitest": "^1.1.6"
