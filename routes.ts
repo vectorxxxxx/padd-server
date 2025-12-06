@@ -8,6 +8,7 @@ import { jupiterTopTrendingService } from "./jupiterTopTrendingService";
 import launchpadRoutes from "./launchpadRoutes";
 import { priceService } from "./priceService";
 import { isAuthenticated, setupAuth } from "./replitAuth";
+import { fetchChartCandles } from "./services/chartService";
 import { fetchJupiterQuoteServer } from "./services/jupiterService";
 import { storage } from "./storage";
 import { WalletService } from "./walletService";
@@ -660,6 +661,56 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Chart service (pump.fun) candles proxy
+  app.get("/api/chart/:coin/candles", async (req, res) => {
+    try {
+      const coin = String(req.params.coin || '');
+      const interval = typeof req.query.interval === 'string' ? req.query.interval : undefined;
+      const limit = req.query.limit !== undefined ? req.query.limit : undefined;
+      const currency = typeof req.query.currency === 'string' ? req.query.currency : undefined;
+      const rawCreated = req.query.createdTs;
+      let createdTs: number | undefined = undefined;
+      if (rawCreated === undefined || rawCreated === null || String(rawCreated).trim() === '') {
+        // If client didn't supply a usable createdTs, use current time immediately
+        createdTs = Date.now();
+      } else {
+        const num = Number(rawCreated);
+        if (!Number.isNaN(num) && Number.isFinite(num)) {
+          createdTs = Math.floor(num);
+        } else {
+          // Fallback to current time if parsing fails
+          createdTs = Date.now();
+        }
+      }
+      const program = typeof req.query.program === 'string' ? req.query.program : undefined;
+
+      let result = await fetchChartCandles(coin, { interval, limit, currency, createdTs, program });
+
+      // If pump returns a Bad Request about `createdTs` not being an integer,
+      // try a best-effort retry by supplying the current timestamp (ms).
+      if (result.status === 400 && typeof result.rawText === 'string' && result.rawText.toLowerCase().includes('createdts')) {
+        console.warn('/api/chart/:coin/candles - pump returned 400 related to createdTs, retrying with current timestamp', { coin, interval, limit, currency, program });
+        try {
+          const fallbackCreated = Date.now();
+          result = await fetchChartCandles(coin, { interval, limit, currency, createdTs: fallbackCreated, program });
+        } catch (err) {
+          console.error('/api/chart/:coin/candles - retry with createdTs failed', err);
+        }
+      }
+
+      if (result.json !== null) {
+        return res.status(result.status).json(result.json);
+      }
+
+      // Fallback: return raw text if JSON parse failed
+      res.status(result.status).send(result.rawText);
+    } catch (err) {
+      console.error("/api/chart/:coin/candles proxy error:", err);
+      if ((err as any)?.name === 'AbortError') return res.status(504).json({ success: false, error: 'Chart request timed out' });
+      res.status(502).json({ success: false, error: (err instanceof Error) ? err.message : 'Proxy error' });
+    }
+  });
+
   // Jupiter quote (ultra/order) with server-side rate limiting/caching
   app.get("/api/jupiter/quote", async (req, res) => {
     console.log('[api/jupiter/quote] incoming request', {
@@ -1042,10 +1093,38 @@ export async function registerRoutes(app: Express): Promise<Server> {
       try {
         if (!admin.apps || admin.apps.length === 0) {
           try {
-            // eslint-disable-next-line @typescript-eslint/no-var-requires
-            const svc = require('../serviceacc.json');
-            // If serviceacc.json present, prefer initializing with databaseURL if available in env
-            admin.initializeApp({ credential: admin.credential.cert(svc as any), databaseURL: process.env.FIREBASE_DATABASE_URL });
+            // Prefer server-only env vars (do NOT use NEXT_PUBLIC_ prefixes for secrets)
+            const loadSvc = () => {
+              // 1) raw JSON in env
+              const rawJson = process.env.SERVICE_ACCOUNT_JSON || process.env.FIREBASE_SERVICE_ACCOUNT;
+              if (rawJson) {
+                try { return JSON.parse(rawJson); } catch (e) { /* fallthrough */ }
+              }
+              // 2) base64-encoded JSON
+              const b64 = process.env.SERVICE_ACCOUNT_BASE64 || process.env.SERVICEACC_B64 || process.env.SERVICE_JSON_B64;
+              if (b64) {
+                try {
+                  const decoded = Buffer.from(b64, 'base64').toString('utf8');
+                  return JSON.parse(decoded);
+                } catch (e) {
+                  // continue to file fallback
+                }
+              }
+              // 3) filesystem fallback (existing serviceacc.json file)
+              try {
+                // eslint-disable-next-line @typescript-eslint/no-var-requires
+                return require('../serviceacc.json');
+              } catch (e) {
+                return null;
+              }
+            };
+
+            const svc = loadSvc();
+            if (svc) {
+              admin.initializeApp({ credential: admin.credential.cert(svc as any), databaseURL: process.env.FIREBASE_DATABASE_URL });
+            } else {
+              try { admin.initializeApp(); } catch { }
+            }
           } catch (e) {
             try { admin.initializeApp(); } catch { }
           }
@@ -1100,12 +1179,24 @@ export async function registerRoutes(app: Express): Promise<Server> {
             // Initialize firebase-admin with service account if not already
             if (!admin.apps || admin.apps.length === 0) {
               try {
-                // service account file at repo root
-                // eslint-disable-next-line @typescript-eslint/no-var-requires
-                const svc = require('../serviceacc.json');
-                admin.initializeApp({ credential: admin.credential.cert(svc as any) });
+                const loadSvc = () => {
+                  const rawJson = process.env.SERVICE_ACCOUNT_JSON || process.env.FIREBASE_SERVICE_ACCOUNT;
+                  if (rawJson) {
+                    try { return JSON.parse(rawJson); } catch (e) { }
+                  }
+                  const b64 = process.env.SERVICE_ACCOUNT_BASE64 || process.env.SERVICEACC_B64 || process.env.SERVICE_JSON_B64;
+                  if (b64) {
+                    try { return JSON.parse(Buffer.from(b64, 'base64').toString('utf8')); } catch (e) { }
+                  }
+                  try { return require('../serviceacc.json'); } catch (e) { return null; }
+                };
+                const svc = loadSvc();
+                if (svc) {
+                  admin.initializeApp({ credential: admin.credential.cert(svc as any) });
+                } else {
+                  try { admin.initializeApp(); } catch { }
+                }
               } catch (e) {
-                // fallback: initialize without explicit creds (environment-based)
                 try { admin.initializeApp(); } catch { }
               }
             }
