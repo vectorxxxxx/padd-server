@@ -1,5 +1,5 @@
 import { Connection, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
-import cheerio from 'cheerio';
+import { load as cheerioLoad } from 'cheerio';
 import type { Express } from "express";
 import admin from 'firebase-admin';
 import { createServer, type Server } from "http";
@@ -986,7 +986,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const rawHtml = await resp.text();
 
       // Load with cheerio for robust DOM manipulation
-      const $ = cheerio.load(rawHtml, { decodeEntities: false });
+      const $ = cheerioLoad(rawHtml, { decodeEntities: false });
 
       // Ensure <base> is present so relative URLs resolve correctly
       if ($('head base[href]').length === 0) {
