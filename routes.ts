@@ -1,5 +1,4 @@
 import { Connection, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
-import { load as cheerioLoad } from 'cheerio';
 import type { Express } from "express";
 import admin from 'firebase-admin';
 import { createServer, type Server } from "http";
@@ -26,8 +25,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
   await priceService.start();
   gmgnService.start();
 
+  import { load as cheerioLoad } from 'cheerio';
+  import puppeteer from 'puppeteer';
   // Simple in-memory cache for proxied GMGN pages to reduce fetch frequency
   const gmgnCache = new Map<string, { html: string; expiresAt: number }>();
+  // Launch a persistent Puppeteer browser at startup to render GMGN pages.
+  // If launching fails, we will fall back to a plain fetch approach.
+  let browser: puppeteer.Browser | null = null;
+  try {
+    browser = await puppeteer.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] });
+    console.log('Puppeteer launched for GMGN rendering');
+  } catch (err) {
+    console.warn('Failed to launch Puppeteer; will fall back to HTTP fetch for GMGN proxy', err);
+    browser = null;
+  }
 
   // Wallet connection endpoint - creates user session with wallet info
   app.post("/api/auth/wallet-connect", async (req: any, res) => {
@@ -976,14 +987,46 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.send(cached.html);
       }
 
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 20000);
-      const resp = await fetch(target, { signal: controller.signal, redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0 (compatible; PaddProxy/1.0)' } });
-      clearTimeout(timeout);
+      let rawHtml: string;
 
-      if (!resp.ok) return res.status(resp.status).send(await resp.text());
+      if (browser) {
+        // Use Puppeteer to render the page like a real browser
+        let page: puppeteer.Page | null = null;
+        try {
+          page = await browser.newPage();
+          await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36');
+          await page.setViewport({ width: 1200, height: 800 });
+          // Some sites block headless; set headless hints
+          await page.evaluateOnNewDocument(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+          });
 
-      const rawHtml = await resp.text();
+          await page.goto(target, { waitUntil: 'networkidle2', timeout: 30000 });
+          // Give some extra time for dynamic content
+          await page.waitForTimeout(500);
+          rawHtml = await page.content();
+        } catch (err) {
+          console.warn('/embed/gmgn puppeteer render failed, falling back to HTTP fetch', err);
+          if (page) try { await page.close(); } catch (_) { }
+          // fallback to fetch below
+          rawHtml = '';
+        } finally {
+          if (page) try { await page.close(); } catch (_) { }
+        }
+      } else {
+        rawHtml = '';
+      }
+
+      // If puppeteer did not produce HTML, fallback to a direct HTTP fetch
+      if (!rawHtml) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 20000);
+        const resp = await fetch(target, { signal: controller.signal, redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0 (compatible; PaddProxy/1.0)' } });
+        clearTimeout(timeout);
+
+        if (!resp.ok) return res.status(resp.status).send(await resp.text());
+        rawHtml = await resp.text();
+      }
 
       // Load with cheerio for robust DOM manipulation
       const $ = cheerioLoad(rawHtml, { decodeEntities: false });
