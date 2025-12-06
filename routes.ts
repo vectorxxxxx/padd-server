@@ -1,7 +1,9 @@
 import { Connection, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
+import { load as cheerioLoad } from 'cheerio';
 import type { Express } from "express";
 import admin from 'firebase-admin';
 import { createServer, type Server } from "http";
+import puppeteer from 'puppeteer';
 import { gmgnService } from "./gmgnService";
 import { jupiterService } from "./jupiterService";
 import { jupiterTopTrendingService } from "./jupiterTopTrendingService";
@@ -25,8 +27,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
   await priceService.start();
   gmgnService.start();
 
-  import { load as cheerioLoad } from 'cheerio';
-  import puppeteer from 'puppeteer';
   // Simple in-memory cache for proxied GMGN pages to reduce fetch frequency
   const gmgnCache = new Map<string, { html: string; expiresAt: number }>();
   // Launch a persistent Puppeteer browser at startup to render GMGN pages.

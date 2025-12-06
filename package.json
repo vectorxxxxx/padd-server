@@ -6,7 +6,7 @@
     "scripts": {
         "dev": "cross-env NODE_ENV=development tsx index.ts",
         "start": "cross-env NODE_ENV=production tsx index.ts",
-        "build": "esbuild index.ts --platform=node --bundle --format=esm --outdir=dist --out-extension:.js=.mjs --external:lightningcss --external:vite --external:dotenv",
+        "build": "esbuild index.ts --platform=node --bundle --format=esm --outdir=dist --out-extension:.js=.mjs --external:lightningcss --external:vite --external:dotenv --external:cheerio --external:puppeteer",
         "test": "vitest"
     },
     "dependencies": {
