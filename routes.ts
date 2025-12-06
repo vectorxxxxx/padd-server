@@ -2,7 +2,9 @@ import { Connection, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, se
 import { load as cheerioLoad } from 'cheerio';
 import type { Express } from "express";
 import admin from 'firebase-admin';
+import fs from 'fs';
 import { createServer, type Server } from "http";
+import path from 'path';
 import puppeteer from 'puppeteer';
 import { gmgnService } from "./gmgnService";
 import { jupiterService } from "./jupiterService";
@@ -33,10 +35,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // If launching fails, we will fall back to a plain fetch approach.
   let browser: puppeteer.Browser | null = null;
   try {
-    browser = await puppeteer.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] });
-    console.log('Puppeteer launched for GMGN rendering');
+    const profileDir = process.env.PUPPETEER_PROFILE_DIR ? path.resolve(process.env.PUPPETEER_PROFILE_DIR) : path.resolve(process.cwd(), '.local', 'puppeteer_profile');
+    const PUPPETEER_ARGS = [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-web-security',
+      '--disable-gpu',
+    ];
+
+    await fs.promises.mkdir(profileDir, { recursive: true }).catch(() => { });
+
+    browser = await puppeteer.launch({ headless: true, userDataDir: profileDir, args: PUPPETEER_ARGS });
+    console.log('Puppeteer launched for GMGN rendering (profileDir=', profileDir, ')');
   } catch (err) {
-    console.warn('Failed to launch Puppeteer; will fall back to HTTP fetch for GMGN proxy', err);
+    console.warn('Failed to launch Puppeteer; proxy will return 502 when rendering fails', err);
     browser = null;
   }
 
@@ -994,16 +1008,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
         let page: puppeteer.Page | null = null;
         try {
           page = await browser.newPage();
-          await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36');
-          await page.setViewport({ width: 1200, height: 800 });
-          // Some sites block headless; set headless hints
-          await page.evaluateOnNewDocument(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+          // match gmgnService headers/UA
+          const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+          await page.setUserAgent(UA);
+          await page.setExtraHTTPHeaders({
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Sec-CH-UA': '"Google Chrome";v="120", "Chromium";v="120", "Not=A?Brand";v="24"',
+            'Sec-CH-UA-Platform': '"Windows"',
+            'Sec-CH-UA-Mobile': '?0',
           });
+          await page.setViewport({ width: 1200, height: 800 });
+          // avoid webdriver flag
+          await page.evaluateOnNewDocument(() => { Object.defineProperty(navigator, 'webdriver', { get: () => false }); });
 
-          await page.goto(target, { waitUntil: 'networkidle2', timeout: 30000 });
-          // Give some extra time for dynamic content
-          await page.waitForTimeout(500);
+          await page.goto(target, { waitUntil: 'networkidle2', timeout: 60_000 });
+          await page.waitForTimeout(3_000);
           rawHtml = await page.content();
         } catch (err) {
           console.warn('/embed/gmgn puppeteer render failed, falling back to HTTP fetch', err);
@@ -1017,15 +1036,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
         rawHtml = '';
       }
 
-      // If puppeteer did not produce HTML, fallback to a direct HTTP fetch
+      // If Puppeteer did not produce HTML, DO NOT fallback to HTTP fetch.
+      // Return a clear error so the caller can detect Puppeteer failures.
       if (!rawHtml) {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 20000);
-        const resp = await fetch(target, { signal: controller.signal, redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0 (compatible; PaddProxy/1.0)' } });
-        clearTimeout(timeout);
-
-        if (!resp.ok) return res.status(resp.status).send(await resp.text());
-        rawHtml = await resp.text();
+        const msg = '/embed/gmgn: Puppeteer failed to render page and HTTP fallback is disabled';
+        console.error(msg);
+        return res.status(502).send(msg);
       }
 
       // Load with cheerio for robust DOM manipulation
