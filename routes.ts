@@ -34,8 +34,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Launch a persistent Puppeteer browser at startup to render GMGN pages.
   // If launching fails, we will fall back to a plain fetch approach.
   let browser: puppeteer.Browser | null = null;
-  try {
-    const profileDir = process.env.PUPPETEER_PROFILE_DIR ? path.resolve(process.env.PUPPETEER_PROFILE_DIR) : path.resolve(process.cwd(), '.local', 'puppeteer_profile');
+    try {
+    // Use a distinct profile directory for the proxy renderer so it doesn't
+    // conflict with the main gmgnService Puppeteer profile directory.
+    const profileDir = process.env.PUPPETEER_PROXY_PROFILE_DIR
+      ? path.resolve(process.env.PUPPETEER_PROXY_PROFILE_DIR)
+      : path.resolve(process.cwd(), '.local', 'puppeteer_profile_proxy');
     const PUPPETEER_ARGS = [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -53,6 +57,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
     console.warn('Failed to launch Puppeteer; proxy will return 502 when rendering fails', err);
     browser = null;
   }
+
+  // Ensure we close the proxy browser on process exit to avoid orphan processes
+  const closeProxyBrowser = async () => {
+    if (browser) {
+      try {
+        await browser.close();
+      } catch {
+        // ignore
+      }
+      browser = null;
+    }
+  };
+
+  process.once('SIGINT', closeProxyBrowser);
+  process.once('SIGTERM', closeProxyBrowser);
 
   // Wallet connection endpoint - creates user session with wallet info
   app.post("/api/auth/wallet-connect", async (req: any, res) => {
