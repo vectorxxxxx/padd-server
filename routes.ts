@@ -1,4 +1,5 @@
 import { Connection, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
+import cheerio from 'cheerio';
 import type { Express } from "express";
 import admin from 'firebase-admin';
 import { createServer, type Server } from "http";
@@ -24,6 +25,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
   await jupiterTopTrendingService.start();
   await priceService.start();
   gmgnService.start();
+
+  // Simple in-memory cache for proxied GMGN pages to reduce fetch frequency
+  const gmgnCache = new Map<string, { html: string; expiresAt: number }>();
 
   // Wallet connection endpoint - creates user session with wallet info
   app.post("/api/auth/wallet-connect", async (req: any, res) => {
@@ -944,6 +948,91 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const message = error instanceof Error ? error.message : "Unknown error";
       console.error("[GMGN] token holders error:", message);
       res.status(500).json({ success: false, error: message });
+    }
+  });
+
+  // Proxy GMGN embed page and strip branding / powered-by anchor
+  // Example: /embed/gmgn/sol/:mint?theme=light&interval=15
+  app.get("/embed/gmgn/:chain/:mint", async (req, res) => {
+    try {
+      const chain = String(req.params.chain || "sol");
+      const mint = String(req.params.mint || "");
+      if (!mint) return res.status(400).send("Missing mint parameter");
+
+      // Build target URL with forwarded query params
+      const base = `https://www.gmgn.cc/kline/${encodeURIComponent(chain)}/${encodeURIComponent(mint)}`;
+      const qs = new URLSearchParams();
+      for (const [k, v] of Object.entries(req.query)) {
+        if (typeof v === 'string') qs.set(k, v);
+      }
+      const target = qs.toString() ? `${base}?${qs.toString()}` : base;
+
+      // Simple cache key
+      const cacheKey = target;
+      const now = Date.now();
+      const cached = gmgnCache.get(cacheKey);
+      if (cached && cached.expiresAt > now) {
+        res.set({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=30' });
+        return res.send(cached.html);
+      }
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 20000);
+      const resp = await fetch(target, { signal: controller.signal, redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0 (compatible; PaddProxy/1.0)' } });
+      clearTimeout(timeout);
+
+      if (!resp.ok) return res.status(resp.status).send(await resp.text());
+
+      const rawHtml = await resp.text();
+
+      // Load with cheerio for robust DOM manipulation
+      const $ = cheerio.load(rawHtml, { decodeEntities: false });
+
+      // Ensure <base> is present so relative URLs resolve correctly
+      if ($('head base[href]').length === 0) {
+        $('head').prepend('<base href="https://www.gmgn.cc/">');
+      }
+
+      // Rewrite root-relative and protocol-relative src/href to absolute gmgn URLs
+      $('*[src], *[href]').each((_, el) => {
+        const attribs: Array<'src' | 'href'> = ['src', 'href'];
+        attribs.forEach((a) => {
+          const val = $(el).attr(a);
+          if (!val) return;
+          if (val.startsWith('//')) {
+            $(el).attr(a, 'https:' + val);
+          } else if (val.startsWith('/')) {
+            $(el).attr(a, `https://www.gmgn.cc${val}`);
+          }
+        });
+      });
+
+      // Remove powered-by anchors/images reliably
+      // Remove anchors that contain an image with the powered logo
+      $('a').filter((_, el) => $(el).find('img[src*="ic_powered_by_logo"]').length > 0).remove();
+      // Remove anchors that link to gmgn.ai
+      $('a[href*="gmgn.ai"]').remove();
+      // Remove anchors with the known class
+      $('a.css-14cme0a').remove();
+      // Remove any powered-by images directly
+      $('img[src*="ic_powered_by_logo"]').remove();
+
+      // Inject a small cleanup script to remove any branding added dynamically
+      const cleanupScript = `
+<script>/** Remove GMGN powered-by anchors/images if dynamically inserted */(function(){function r(){try{document.querySelectorAll('a[href*="gmgn.ai"]').forEach(e=>e.remove());document.querySelectorAll('img[src*="ic_powered_by_logo"]').forEach(e=>e.remove());document.querySelectorAll('a.css-14cme0a').forEach(e=>e.remove());}catch(e){} }document.addEventListener('DOMContentLoaded',r);setTimeout(r,800);setInterval(r,2500);})();</script>`;
+      $('body').append(cleanupScript);
+
+      const finalHtml = $.html();
+
+      // Cache for short TTL (30s)
+      gmgnCache.set(cacheKey, { html: finalHtml, expiresAt: Date.now() + 30_000 });
+
+      res.set({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=30' });
+      return res.send(finalHtml);
+    } catch (err) {
+      console.error('/embed/gmgn proxy error:', err);
+      if ((err as any)?.name === 'AbortError') return res.status(504).send('Timed out fetching remote page');
+      return res.status(502).send('Failed to proxy GMGN page');
     }
   });
 
