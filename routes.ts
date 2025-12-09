@@ -7,7 +7,9 @@ import { jupiterService } from "./jupiterService";
 import { jupiterTopTrendingService } from "./jupiterTopTrendingService";
 import launchpadRoutes from "./launchpadRoutes";
 import * as balanceTx from './lib/balanceTx';
+import { distributeFeeProRataSol, loadVaultComposition } from './lib/fees';
 import adminHelper from './lib/firebaseAdmin';
+import { computeBorrowSol, computeSizeToken } from './lib/math';
 import { priceService } from "./priceService";
 import { isAuthenticated, setupAuth } from "./replitAuth";
 import { fetchChartCandles } from "./services/chartService";
@@ -974,6 +976,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Debug endpoint: read stored off-chain balance for a user (read-only)
+  app.get('/api/debug/balance', async (req: any, res) => {
+    try {
+      const uid = (req.query && (req.query.uid || req.query.id)) as string | undefined;
+      if (!uid) return res.status(400).json({ success: false, error: 'uid required' });
+      try {
+        const db = getAdminDb();
+        const snap = await db.ref(`/users/${uid}/balance`).get();
+        const val = snap && snap.exists() ? snap.val() : null;
+        return res.json({ success: true, uid, balance: val, type: typeof val });
+      } catch (readErr) {
+        console.error('[API][DEBUG][BALANCE] read error', readErr);
+        return res.status(500).json({ success: false, error: 'read_error', detail: String(readErr) });
+      }
+    } catch (err) {
+      console.error('/api/debug/balance error', err);
+      return res.status(500).json({ success: false, error: 'server_error' });
+    }
+  });
+
   // Get user info (try local storage then Firebase admin). Supports:
   // - `/api/users/:id` (path param)
   // - `/api/users/profile?uid=...` (query param used by some clients)
@@ -1140,6 +1162,262 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Close long position (calls shared engine implementation in padd-ui)
   // Uses server `priceService` as the authoritative source for SOL price (no other fallback for SOL).
   // Open long position - uses same auth flow and price sourcing as close-long
+  // Preflight: compute feeBreak and distribution without performing DB writes
+  app.post('/api/engine/open-long/preflight', async (req: any, res) => {
+    try {
+      const { vaultId: bodyVaultId, mint: bodyMint, vaultName, collateralSol, leverageBps, entryPriceUsd: bodyEntry, solPriceUsd: bodySol } = req.body || {};
+      // Resolve vault key: callers may pass a canonical `vaultId`, or a token mint, or a vaultName.
+      // Prefer an explicit `vaultId` when supplied. Use `/vaultsByMint/<mint>` mapping
+      // when a token mint is supplied. Fall back to legacy behavior (vault keyed by mint)
+      // and name-based lookups for backward compatibility.
+      let vaultId = (bodyVaultId && String(bodyVaultId).trim() !== '') ? bodyVaultId : bodyMint;
+      const db = getAdminDb();
+      const resolveCandidates = async (mintStr: string) => {
+        // 1) check mapping /vaultsByMint/<mint>
+        try {
+          const mapSnap = await db.ref(`/vaultsByMint/${mintStr}`).get();
+          if (mapSnap.exists()) {
+            const map = mapSnap.val();
+            const keys = Object.keys(map || {});
+            return keys;
+          }
+        } catch (e) {
+          /* ignore mapping read errors */
+        }
+        // 2) legacy: check if /vaults/<mint> exists (old pattern where mint was key)
+        try {
+          const legacySnap = await db.ref(`/vaults/${mintStr}`).get();
+          if (legacySnap.exists()) {
+            const legacyVal = legacySnap.val();
+            if (legacyVal && legacyVal.migratedTo) return [legacyVal.migratedTo];
+            // treat the mint as a legacy vaultId
+            return [mintStr];
+          }
+        } catch (e) {
+          /* ignore */
+        }
+        return [] as string[];
+      };
+
+      if ((!vaultId || typeof vaultId !== 'string' || vaultId.trim() === '') && vaultName) {
+        // Name-based resolution: prefer exact equalTo query then fallback to case-insensitive scan
+        try {
+          const qSnap = await db.ref('/vaults').orderByChild('name').equalTo(String(vaultName)).get();
+          if (qSnap.exists()) {
+            const matches = qSnap.val();
+            const keys = Object.keys(matches || {});
+            if (keys.length > 1) console.warn('/api/engine/open-long/preflight multiple vaults matched vaultName', { vaultName, keys });
+            vaultId = keys[0];
+          } else {
+            const allSnap = await db.ref('/vaults').get();
+            if (allSnap.exists()) {
+              const all = allSnap.val();
+              const norm = (String(vaultName || '')).toLowerCase().trim();
+              const matches = Object.entries(all).filter(([, v]: any) => {
+                const n = v && v.name ? String(v.name).toLowerCase().trim() : '';
+                return n === norm;
+              }).map(([k]) => k);
+              if (matches.length === 1) {
+                vaultId = matches[0];
+                console.info('/api/engine/open-long/preflight resolved vaultName via fallback', { vaultName, vaultId });
+              } else if (matches.length > 1) {
+                console.warn('/api/engine/open-long/preflight ambiguous vaultName after fallback', { vaultName, matches });
+                return res.status(400).json({ success: false, error: 'ambiguous_vaultName', matches });
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('/api/engine/open-long/preflight failed to resolve vaultName', { vaultName, err: e });
+        }
+      }
+
+      // If the caller provided a mint-like value, try resolving via mapping/legacy
+      if (vaultId && vaultId.length > 0) {
+        const candidates = await resolveCandidates(vaultId);
+        if (candidates.length === 1) {
+          vaultId = candidates[0];
+        } else if (candidates.length > 1) {
+          // ambiguous: return candidates for client selection
+          const candidatesMeta = await Promise.all(candidates.map(async (id) => {
+            try { const s = await db.ref(`/vaults/${id}`).get(); return { vaultId: id, name: s.exists() ? s.val().name : null, tvlSol: s.exists() ? s.val().tvlSol : null, creatorUid: s.exists() ? s.val().creatorUid : null } } catch { return { vaultId: id } }
+          }))
+          return res.status(400).json({ success: false, error: 'ambiguous_mint', candidates: candidatesMeta });
+        } else {
+          // no mapping/legacy match. If the client provided an explicit `vaultId`, keep it.
+          // Otherwise fall back to the original `mint` value (if any) or unset.
+          if (!bodyVaultId) {
+            vaultId = bodyMint || null;
+          }
+        }
+      }
+      const coll = Number(collateralSol);
+      const lever = Number(leverageBps);
+      if (!vaultId || !Number.isFinite(coll) || coll <= 0 || !Number.isFinite(lever) || lever <= 0) {
+        return res.status(400).json({ success: false, error: 'vaultId|vaultName, collateralSol and leverageBps required' });
+      }
+      // composition will be determined below (prefer vault.creatorUid then composition)
+
+      // determine token mint from the resolved vaultId, then determine prices
+      let tokenMint: string | null = null;
+      try {
+        try {
+          const vaultSnap = await db.ref(`/vaults/${vaultId}`).get();
+          if (vaultSnap.exists()) {
+            const vaultVal = vaultSnap.val();
+            tokenMint = vaultVal && vaultVal.tokenMint ? vaultVal.tokenMint : null;
+          } else {
+            // vault not found at canonical key; if client explicitly provided vaultId, return error
+            if (bodyVaultId) return res.status(400).json({ success: false, error: 'vault_not_found' });
+            // fallback: treat the provided value as a token mint
+            tokenMint = vaultId;
+          }
+        } catch (e) {
+          if (bodyVaultId) return res.status(400).json({ success: false, error: 'vault_not_found' });
+          tokenMint = vaultId;
+        }
+      } catch (e) {
+        tokenMint = vaultId;
+      }
+
+      // determine prices: prefer client-supplied, then price_cache, then GMGN lookup
+      let price: number | null = (bodyEntry != null) ? Number(bodyEntry) : null;
+      let solPrice: number | null = (bodySol != null) ? Number(bodySol) : null;
+      try {
+        if ((price == null) || (solPrice == null)) {
+          try {
+            if (price == null && tokenMint) {
+              const priceSnap = await db.ref(`/price_cache/${tokenMint}`).get();
+              if (priceSnap.exists()) price = priceSnap.val().priceUsd || priceSnap.val().price || null;
+            }
+            if (solPrice == null) {
+              const solSnap = await db.ref(`/price_cache/WSOL_MINT`).get();
+              if (solSnap.exists()) solPrice = solSnap.val().priceUsd || solSnap.val().price || null;
+            }
+          } catch (e) {
+            // ignore DB read errors and fall back to GMGN
+          }
+        }
+      } catch (e) {
+        // getAdminDb may fail in some environments; continue to GMGN fallback
+      }
+
+      if (price == null && tokenMint) {
+        try {
+          const coins = await gmgnService.lookup(tokenMint, 'sol');
+          const coin = Array.isArray(coins) && coins.length ? coins[0] : null;
+          if (coin) {
+            const candidates = [
+              coin.price_usd, coin.priceUsd, coin.price, coin.usd_price, coin.last_price, coin.last_price_usd, coin.price_usd_display,
+              coin.market_price, coin.price_usd_native
+            ];
+            for (const v of candidates) {
+              if (v == null) continue;
+              const nn = Number(v);
+              if (Number.isFinite(nn) && nn > 0) {
+                price = nn;
+                break;
+              }
+            }
+            try { if (price == null && coin.data && typeof coin.data.price === 'number') price = coin.data.price } catch { }
+          }
+        } catch (gmgnErr) { /* ignore */ }
+      }
+
+      if (solPrice == null && tokenMint) {
+        try {
+          const coins = await gmgnService.lookup(tokenMint, 'sol');
+          const coin = Array.isArray(coins) && coins.length ? coins[0] : null;
+          if (coin && coin.last_price_usd) solPrice = Number(coin.last_price_usd);
+        } catch { /* ignore */ }
+      }
+
+      if (!price || !solPrice) return res.status(400).json({ success: false, error: 'prices_unavailable', price, solPrice });
+
+      // compute borrow, size, notional
+      const borrowSol = computeBorrowSol(coll, lever);
+      const sizeToken = computeSizeToken(coll, borrowSol, solPrice, price);
+      const notionalUsd = price * sizeToken;
+
+      // load vault params and composition for fee calculation
+      let vaultParams: any = {};
+      try {
+        const snap = await db.ref(`/vaults/${vaultId}/params`).get();
+        if (snap.exists()) vaultParams = snap.val();
+      } catch { /* ignore */ }
+      const feeBps = typeof vaultParams.openFeeBps === 'number' ? vaultParams.openFeeBps : 10;
+      const vaultSharePct = typeof vaultParams.vaultSharePct === 'number' ? vaultParams.vaultSharePct : 0.7;
+      const ownerKeepPct = typeof vaultParams.ownerKeepPct === 'number' ? vaultParams.ownerKeepPct : 0.6;
+
+      // Charge trader 10% of their collateral (in SOL) as the total fee.
+      const feeSol = (coll || 0) * 0.10
+      const feeUsd = feeSol * solPrice
+      const feeVaultSol = feeSol * vaultSharePct
+      const feePlatformSol = feeSol - feeVaultSol
+      const feeBreak = { notionalUsd, feeBps, feeUsd, feeSol, feeVaultSol, feePlatformSol, usedSolPrice: solPrice }
+      // Prefer the vault's `creatorUid` as the source of truth for owner allocation.
+      // If `creatorUid` exists on `/vaults/<mint>`, allocate the vault share to that creator.
+      let composition: any = {};
+      let vaultCreatorUid: string | null = null;
+      let vaultRaw: any = null;
+      try {
+        const vaultSnap = await db.ref(`/vaults/${vaultId}`).get();
+        if (vaultSnap.exists()) {
+          const vault = vaultSnap.val();
+          vaultRaw = vault;
+          if (vault && vault.creatorUid) {
+            vaultCreatorUid = vault.creatorUid;
+            composition = { creator: { uid: vault.creatorUid, sol: 1 } };
+          }
+        }
+      } catch (e) {
+        // ignore and fall back to composition loader below
+      }
+      if (!composition || !composition.creator) {
+        const loaded = await loadVaultComposition(tokenMint);
+        // Log vault creatorUid (if any) and the composition we actually loaded
+        try {
+          console.info('[API][PRELIGHT] vault creatorUid / composition', JSON.stringify({ tokenMint, vaultCreatorUid: vaultCreatorUid || null, loadedComposition: loaded }));
+        } catch (e) {
+          console.info('[API][PRELIGHT] vault creatorUid / composition', { tokenMint, vaultCreatorUid: vaultCreatorUid || null, loadedComposition: loaded });
+        }
+        composition = loaded;
+        // if loaded composition contains creator and we didn't have vaultCreatorUid, set it for response clarity
+        if (!vaultCreatorUid && composition && composition.creator && composition.creator.uid) vaultCreatorUid = composition.creator.uid;
+      } else {
+        try { console.info('[API][PRELIGHT] distribution source uses vault.creatorUid', JSON.stringify({ tokenMint, vaultCreatorUid: composition.creator.uid })) } catch (e) { console.info('[API][PRELIGHT] distribution source uses vault.creatorUid', { tokenMint, vaultCreatorUid: composition.creator.uid }) }
+        if (!vaultCreatorUid && composition && composition.creator && composition.creator.uid) vaultCreatorUid = composition.creator.uid;
+      }
+
+      // Explicit not-found logs to make missing data obvious in server output
+      if (!vaultCreatorUid) {
+        try { console.info('[API][PRELIGHT] vault.creatorUid NOT FOUND', JSON.stringify({ tokenMint })) } catch (e) { console.info('[API][PRELIGHT] vault.creatorUid NOT FOUND', { tokenMint }) }
+      }
+      const isCompositionEmpty = !composition || (typeof composition === 'object' && Object.keys(composition).length === 0);
+      if (isCompositionEmpty) {
+        try { console.info('[API][PRELIGHT] composition EMPTY or missing for vault', JSON.stringify({ tokenMint })) } catch (e) { console.info('[API][PRELIGHT] composition EMPTY or missing for vault', { tokenMint }) }
+      }
+      // Distribute only the vault's share among creator/contributors (owner keep = 100%)
+      let ownerDistrib: any = null;
+      if (vaultCreatorUid) {
+        ownerDistrib = { totalFeeSol: feeBreak.feeVaultSol, platformSol: 0, creatorSol: feeBreak.feeVaultSol, contributors: [], allocatedSum: feeBreak.feeVaultSol };
+        try { console.info('[API][PRELIGHT] authoritative allocation used (preflight)', JSON.stringify({ tokenMint, vaultCreatorUid, creatorSol: ownerDistrib.creatorSol })) } catch (e) { console.info('[API][PRELIGHT] authoritative allocation used (preflight)', { tokenMint, vaultCreatorUid, creatorSol: ownerDistrib.creatorSol }) }
+      } else {
+        ownerDistrib = distributeFeeProRataSol(feeBreak.feeVaultSol, composition, 1.0, 1.0);
+      }
+      const distrib = {
+        totalFeeSol: feeBreak.feeSol,
+        platformSol: (feeBreak.feePlatformSol || 0) + (ownerDistrib.platformSol || 0),
+        creatorSol: ownerDistrib.creatorSol || 0,
+        contributors: ownerDistrib.contributors || [],
+        allocatedSum: feeBreak.feeSol
+      };
+
+      return res.json({ success: true, feeBreak, distrib, sizeToken, borrowSol, notionalUsd, vaultCreatorUid, compositionUsed: composition, vaultRaw });
+    } catch (err: any) {
+      console.error('/api/engine/open-long/preflight error', err);
+      return res.status(500).json({ success: false, error: err?.message || String(err) });
+    }
+  });
   app.post('/api/engine/open-long', async (req: any, res) => {
     try {
       console.log('[API][ENGINE][OPEN_LONG] incoming request', { path: req.path });
@@ -1199,11 +1477,80 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       if (!uid) return res.status(401).json({ success: false, error: 'unauthenticated' });
 
-      const { mint, collateralSol, leverageBps, entryPriceUsd: bodyEntry, solPriceUsd: bodySol } = req.body || {};
+      const { vaultId: bodyVaultId, mint: bodyMint, vaultName, collateralSol, leverageBps, entryPriceUsd: bodyEntry, solPriceUsd: bodySol } = req.body || {};
+      // Resolve vault key: callers may pass a canonical `vaultId`, or a token mint, or a vaultName.
+      let vaultId = (bodyVaultId && String(bodyVaultId).trim() !== '') ? bodyVaultId : bodyMint;
+      const db = getAdminDb();
+      const resolveCandidates = async (mintStr: string) => {
+        try {
+          const mapSnap = await db.ref(`/vaultsByMint/${mintStr}`).get();
+          if (mapSnap.exists()) return Object.keys(mapSnap.val() || {});
+        } catch { }
+        try {
+          const legacySnap = await db.ref(`/vaults/${mintStr}`).get();
+          if (legacySnap.exists()) {
+            const legacyVal = legacySnap.val();
+            if (legacyVal && legacyVal.migratedTo) return [legacyVal.migratedTo];
+            return [mintStr];
+          }
+        } catch { }
+        return [] as string[];
+      };
+
+      if ((!vaultId || typeof vaultId !== 'string' || vaultId.trim() === '') && vaultName) {
+        try {
+          const qSnap = await db.ref('/vaults').orderByChild('name').equalTo(String(vaultName)).get();
+          if (qSnap.exists()) {
+            const matches = qSnap.val();
+            const keys = Object.keys(matches || {});
+            if (keys.length > 1) console.warn('/api/engine/open-long failed to resolve vaultName (multiple matches)', { vaultName, keys });
+            vaultId = keys[0];
+          } else {
+            const allSnap = await db.ref('/vaults').get();
+            if (allSnap.exists()) {
+              const all = allSnap.val();
+              const norm = (String(vaultName || '')).toLowerCase().trim();
+              const matches = Object.entries(all).filter(([, v]: any) => {
+                const n = v && v.name ? String(v.name).toLowerCase().trim() : '';
+                return n === norm;
+              }).map(([k]) => k);
+              if (matches.length === 1) {
+                vaultId = matches[0];
+                console.info('/api/engine/open-long resolved vaultName via fallback', { vaultName, vaultId });
+              } else if (matches.length > 1) {
+                console.warn('/api/engine/open-long ambiguous vaultName after fallback', { vaultName, matches });
+                return res.status(400).json({ success: false, error: 'ambiguous_vaultName', matches });
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('/api/engine/open-long failed to resolve vaultName', { vaultName, err: e });
+        }
+      }
+
+      if (vaultId && vaultId.length > 0) {
+        const candidates = await resolveCandidates(vaultId);
+        if (candidates.length === 1) {
+          vaultId = candidates[0];
+        } else if (candidates.length > 1) {
+          const candidatesMeta = await Promise.all(candidates.map(async (id) => {
+            try { const s = await db.ref(`/vaults/${id}`).get(); return { vaultId: id, name: s.exists() ? s.val().name : null, tvlSol: s.exists() ? s.val().tvlSol : null, creatorUid: s.exists() ? s.val().creatorUid : null } } catch { return { vaultId: id } }
+          }))
+          return res.status(400).json({ success: false, error: 'ambiguous_mint', candidates: candidatesMeta });
+        } else {
+          if (!bodyVaultId) {
+            vaultId = bodyMint || null;
+          }
+        }
+      }
+
       const coll = Number(collateralSol);
       const lever = Number(leverageBps);
-      if (!mint || !Number.isFinite(coll) || coll <= 0 || !Number.isFinite(lever) || lever <= 0) {
-        return res.status(400).json({ success: false, error: 'mint, collateralSol and leverageBps required' });
+      if (!vaultId && vaultName) {
+        return res.status(400).json({ success: false, error: `vaultName not found: ${vaultName}` });
+      }
+      if (!vaultId || !Number.isFinite(coll) || coll <= 0 || !Number.isFinite(lever) || lever <= 0) {
+        return res.status(400).json({ success: false, error: 'vaultId|vaultName, collateralSol and leverageBps required' });
       }
 
       // Fetch authoritative SOL price
@@ -1219,16 +1566,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(500).json({ success: false, error: 'engine.openLong unavailable' });
       }
 
+
+
       const opts: any = {};
       if (bodyEntry != null) opts.entryPriceUsd = Number(bodyEntry);
       if (bodySol != null) opts.solPriceUsd = Number(bodySol);
       // Pass authoritative solPrice if not provided
       if (opts.solPriceUsd == null) opts.solPriceUsd = solPriceUsd;
 
-      const result = await engine.openLong(String(uid), String(mint), coll, lever, opts);
+      const result = await engine.openLong(String(uid), String(vaultId), coll, lever, opts);
       return res.json(result);
     } catch (err: any) {
       console.error('/api/engine/open-long error', err);
+      // If engine provided feeBreak/currentBalance attach them to the response for debugging
+      if (err && (err.feeBreak || err.currentBalance)) {
+        return res.status(400).json({ success: false, error: err?.message || String(err), feeBreak: err.feeBreak || null, currentBalance: err.currentBalance || null });
+      }
       return res.status(500).json({ success: false, error: err?.message || String(err) });
     }
   });
@@ -1358,6 +1711,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Simple flattened list for client discovery: returns array of { vaultId, tokenMint, name, creatorUid, tvlSol }
+  app.get('/api/engine/vaults/list-simple', async (_req: any, res) => {
+    try {
+      const db = getAdminDb();
+      const snap = await db.ref('/vaults').get();
+      const vaults = snap && snap.exists() ? snap.val() : {};
+      const list = Object.entries(vaults || {}).map(([id, v]: any) => ({
+        vaultId: id,
+        tokenMint: v && v.tokenMint ? v.tokenMint : id,
+        name: v && v.name ? v.name : null,
+        creatorUid: v && v.creatorUid ? v.creatorUid : null,
+        tvlSol: v && typeof v.tvlSol === 'number' ? v.tvlSol : null,
+      }));
+      return res.json({ success: true, list });
+    } catch (err: any) {
+      console.error('/api/engine/vaults/list-simple error', err);
+      return res.status(500).json({ success: false, error: err?.message || String(err) });
+    }
+  });
+
   // Create a new vault (PADD) - accept session auth, Firebase idToken, or wallet-session
   app.post("/api/engine/vaults/create", async (req: any, res) => {
     try {
@@ -1480,7 +1853,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           }
           return res.status(400).json({ success: false, error: result?.error || 'create_failed' });
         }
-        return res.json({ success: true, vault: result.vault });
+        return res.json({ success: true, vault: result.vault, vaultId: result.vaultId || null });
       } catch (err: any) {
         // refund deducted initial amount if present
         if (initialSol > 0) {
@@ -1558,9 +1931,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       if (!uid) return res.status(401).json({ success: false, error: 'unauthenticated' });
 
-      const { mint, amountSol, feeKeepPct } = req.body || {};
+      const { vaultId: bodyVaultId, mint: bodyMint, amountSol, feeKeepPct } = req.body || {};
+      const mint = (bodyVaultId && String(bodyVaultId).trim() !== '') ? bodyVaultId : bodyMint;
       const amt = Number(amountSol);
-      if (!mint || !Number.isFinite(amt) || amt <= 0) return res.status(400).json({ success: false, error: 'invalid mint or amount' });
+      if (!mint || !Number.isFinite(amt) || amt <= 0) return res.status(400).json({ success: false, error: 'invalid vaultId/mint or amount' });
 
       // Atomically deduct the user's stored balance (off-chain) before performing the deposit
       try {

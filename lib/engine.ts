@@ -1,7 +1,7 @@
 // Server-local copy of padd-ui/engine/engine.ts with imports adjusted to server/lib
 import { v4 as uuidv4 } from 'uuid'
 import { coerceNum, transactionWithReadGuard } from './balanceTx'
-import { calculateFeesUsdToSol, distributeFeeProRataSol, loadVaultComposition } from './fees'
+import { distributeFeeProRataSol, loadVaultComposition } from './fees'
 import { getAdminDb } from './firebaseAdmin'
 import * as math from './math'
 
@@ -12,11 +12,19 @@ function now() {
 }
 
 export async function createVault(mint: string, creatorUid: string, params: any, name?: string, currency?: string) {
-    const path = `/vaults/${mint}`
-    const snap = await getAdminDb().ref(path).get()
-    if (snap.exists()) {
-        return { ok: false, error: 'Vault exists' }
-    }
+    // Create a unique canonical vaultId for the vault and write the
+    // canonical record under `/vaults/<vaultId>`. Do NOT write the
+    // `/vaultsByMint/<mint>` mapping here — mapping writes were removed
+    // to avoid populating the legacy lookup path. To remain
+    // backwards-compatible with any callers that expect `/vaults/<mint>`,
+    // legacy behavior is intentionally not created here; callers should
+    // resolve via canonical `vaultId` or other explicit lookups.
+    const db = getAdminDb()
+    // No legacy `/vaults/<mint>` creation: we create a canonical `/vaults/<vaultId>` record
+    // and a mapping at `/vaultsByMint/<mint>/<vaultId> = true`. Do not write legacy keys.
+
+    const vaultId = uuidv4()
+    const vaultPath = `/vaults/${vaultId}`
     const data: any = {
         tokenMint: mint,
         creatorUid,
@@ -36,9 +44,12 @@ export async function createVault(mint: string, creatorUid: string, params: any,
     data.params.ownerKeepPct = (data.params.ownerKeepPct != null) ? data.params.ownerKeepPct : 0.6
     data.params.vaultSharePct = (data.params.vaultSharePct != null) ? data.params.vaultSharePct : 0.7
 
-    await getAdminDb().ref(path).set(data)
-    console.info(TAG, 'createVault', mint, creatorUid, { name, currency })
-    return { ok: true, vault: data }
+    // Prepare multi-path update: only write the canonical vault record.
+    const updates: Record<string, any> = {}
+    updates[vaultPath] = data
+    await db.ref().update(updates)
+    console.info(TAG, 'createVault', { tokenMint: mint, vaultId, creatorUid, name, currency })
+    return { ok: true, vault: data, vaultId }
 }
 
 export async function creatorDeposit(mint: string, amountSol: number, creatorUid: string) {
@@ -99,9 +110,23 @@ export async function openLong(uid: string, mint: string, collateralSol: number,
     let price: number | null = opts && typeof opts.entryPriceUsd === 'number' ? opts.entryPriceUsd : null
     let solPrice: number | null = opts && typeof opts.solPriceUsd === 'number' ? opts.solPriceUsd : null
 
+    // Determine token mint from the vault keyed by `mint` (caller passes vaultId here).
+    // If no vault exists at that key, treat `mint` as the token mint (legacy behavior).
+    const db = getAdminDb()
+    let tokenMint: string = mint
+    try {
+        const vaultSnap = await db.ref(`/vaults/${mint}`).get()
+        if (vaultSnap.exists()) {
+            const vaultVal = vaultSnap.val()
+            if (vaultVal && vaultVal.tokenMint) tokenMint = vaultVal.tokenMint
+        }
+    } catch (e) {
+        // ignore and fall back to treating `mint` as token mint
+    }
+
     if (price == null || solPrice == null) {
-        const priceSnap = await getAdminDb().ref(`/price_cache/${mint}`).get()
-        const solSnap = await getAdminDb().ref(`/price_cache/WSOL_MINT`).get()
+        const priceSnap = await db.ref(`/price_cache/${tokenMint}`).get()
+        const solSnap = await db.ref(`/price_cache/WSOL_MINT`).get()
         if (price == null) price = priceSnap.exists() ? priceSnap.val().priceUsd : null
         if (solPrice == null) solPrice = solSnap.exists() ? solSnap.val().priceUsd : null
     }
@@ -142,6 +167,13 @@ export async function openLong(uid: string, mint: string, collateralSol: number,
     const borrowUsd = borrowSol * solPrice
 
     const vaultRef = getAdminDb().ref(`/vaults/${mint}`)
+    try {
+        const beforeSnap = await vaultRef.get()
+        const beforeVal = beforeSnap.exists() ? beforeSnap.val() : null
+        try { console.info(TAG, 'vault before borrow tx', JSON.stringify({ mint, beforeVal })) } catch (e) { console.info(TAG, 'vault before borrow tx', { mint, beforeVal }) }
+    } catch (e) {
+        console.warn(TAG, 'failed to read vault before tx', { mint, err: e })
+    }
     const txResult = await vaultRef.transaction((v: any) => {
         if (v == null) return v
         const tvlSol = v.tvlSol || 0
@@ -161,12 +193,23 @@ export async function openLong(uid: string, mint: string, collateralSol: number,
         v.updatedAt = now()
         return v
     }, undefined, false)
+    try {
+        const afterSnap = await vaultRef.get()
+        const afterVal = afterSnap.exists() ? afterSnap.val() : null
+        try { console.info(TAG, 'vault after borrow tx', JSON.stringify({ mint, committed: txResult?.committed, afterVal })) } catch (e) { console.info(TAG, 'vault after borrow tx', { mint, committed: txResult?.committed, afterVal }) }
+    } catch (e) {
+        console.warn(TAG, 'failed to read vault after tx', { mint, err: e })
+    }
 
     if (!txResult.committed) {
         throw new Error('insufficient vault capital')
     }
 
     const tradeId = uuidv4()
+
+    // Declare feeBreak/distrib in outer scope so they are available after the try
+    let feeBreak: any = null
+    let distrib: any = null
 
     try {
         const notionalUsd = entryPriceUsd * sizeToken
@@ -177,20 +220,79 @@ export async function openLong(uid: string, mint: string, collateralSol: number,
         const vaultSharePct = typeof vaultParams.vaultSharePct === 'number' ? vaultParams.vaultSharePct : 0.7
         const ownerKeepPct = typeof vaultParams.ownerKeepPct === 'number' ? vaultParams.ownerKeepPct : 0.6
 
-        const feeBreak = calculateFeesUsdToSol(notionalUsd, feeBps, priceSol, vaultSharePct, { minFeeUsd: 0.01 })
+        // Charge trader 10% of their collateral (in SOL) as the total fee.
+        // feeSol = collateralSol * 0.10
+        const feeSol = (collateralSol || 0) * 0.10
+        const feeUsd = feeSol * priceSol
+        const feeVaultSol = feeSol * vaultSharePct
+        const feePlatformSol = feeSol - feeVaultSol
+        feeBreak = {
+            notionalUsd,
+            feeBps,
+            feeUsd,
+            feeSol,
+            feeVaultSol,
+            feePlatformSol,
+            usedSolPrice: priceSol
+        }
 
-        const composition = await loadVaultComposition(mint)
-        const distrib = distributeFeeProRataSol(feeBreak.feeSol, composition, ownerKeepPct, ownerKeepPct)
+        let composition = await loadVaultComposition(tokenMint)
+        // If composition is empty, fallback to using the vault's creatorUid
+        // so the entire vault share is allocated to that creator automatically.
+        let vaultCreatorUid: string | null = null
+        if (!composition || (!composition.creator && !(composition.contributors && composition.contributors.length > 0))) {
+            try {
+                const vaultSnap = await getAdminDb().ref(`/vaults/${mint}`).get()
+                if (vaultSnap.exists()) {
+                    const vault = vaultSnap.val()
+                    if (vault && vault.creatorUid) {
+                        vaultCreatorUid = vault.creatorUid
+                        // Use a nominal `sol` of 1 for the synthetic composition when needed
+                        composition = { creator: { uid: vault.creatorUid, sol: 1 } }
+                        console.info(TAG, 'fee distribution fallback used vault.creatorUid', { mint, creatorUid: vault.creatorUid })
+                        try { console.info(TAG, 'distribution source (engine)', JSON.stringify({ mint, vaultCreatorUid: vault.creatorUid, composition })) } catch (e) { console.info(TAG, 'distribution source (engine)', { mint, vaultCreatorUid: vault.creatorUid, composition }) }
+                    }
+                }
+            } catch (fbErr) {
+                console.warn(TAG, 'failed to fetch vault for composition fallback', { mint, err: fbErr })
+            }
+        }
+        // Log composition just before distribution to help debug creator allocation
+        try { console.info(TAG, 'distribution composition (engine) before distributeFeeProRataSol', JSON.stringify({ mint, composition, vaultCreatorUid })) } catch (e) { console.info(TAG, 'distribution composition (engine) before distributeFeeProRataSol', { mint, composition, vaultCreatorUid }) }
+        // If we have an authoritative vault creator, allocate the vault share directly to them
+        let ownerDistrib: any = null
+        if (vaultCreatorUid) {
+            ownerDistrib = {
+                totalFeeSol: feeBreak.feeVaultSol,
+                platformSol: 0,
+                creatorSol: feeBreak.feeVaultSol,
+                contributors: [],
+                allocatedSum: feeBreak.feeVaultSol
+            }
+            console.info(TAG, 'authoritative allocation used (engine)', { mint, vaultCreatorUid, creatorSol: ownerDistrib.creatorSol })
+        } else {
+            // Distribute only the vault's share among creator/contributors (owner keep = 100%)
+            ownerDistrib = distributeFeeProRataSol(feeBreak.feeVaultSol, composition, 1.0, 1.0)
+        }
+        // Combine platform amounts: platform gets feePlatformSol plus any platform portion from ownerDistrib
+        distrib = {
+            totalFeeSol: feeBreak.feeSol,
+            platformSol: (feeBreak.feePlatformSol || 0) + (ownerDistrib.platformSol || 0),
+            creatorSol: ownerDistrib.creatorSol || 0,
+            contributors: ownerDistrib.contributors || [],
+            allocatedSum: (feeBreak.feeSol)
+        }
 
         const balanceRef = getAdminDb().ref(`/users/${uid}/balance`)
-        const feeSol = feeBreak.feeSol
+        const feeToCollect = feeBreak.feeSol
+        const totalToDeduct = collateralSol + feeToCollect
 
         try {
             const balSnap = await balanceRef.get()
             const balVal = balSnap.exists() ? balSnap.val() : null
-            console.info(TAG, 'fee collection attempt', { uid, feeSol, balanceBefore: balVal })
+            console.info(TAG, 'balance deduction attempt', { uid, collateralSol, feeToCollect, totalToDeduct, balanceBefore: balVal })
         } catch (readErr) {
-            console.warn(TAG, 'failed to read balance before fee tx', readErr)
+            console.warn(TAG, 'failed to read balance before deduction tx', readErr)
         }
 
         // NOTE: client will perform balance validation. Rely on the atomic
@@ -198,23 +300,37 @@ export async function openLong(uid: string, mint: string, collateralSol: number,
         // of performing a pre-check here which can introduce race conditions.
 
         // Debug: log fee breakdown and a fresh balance read so we can inspect
-        // exact values leading to any `insufficient_balance_for_fee` errors.
+        // exact values leading to any `insufficient_balance` errors.
         try {
-            console.info(TAG, 'feeBreak', feeBreak)
+            // Stringify to avoid logger truncation in hosting platforms
+            try { console.info(TAG, 'feeBreak', JSON.stringify(feeBreak)) } catch (sErr) { console.info(TAG, 'feeBreak', feeBreak) }
             const curSnap = await balanceRef.get()
             const curVal = curSnap.exists() ? curSnap.val() : null
-            console.info(TAG, 'balance before fee tx (fresh read)', { uid, feeSol, balance: curVal })
+            try { console.info(TAG, 'balance before deduction tx (fresh read)', JSON.stringify({ uid, totalToDeduct, balance: curVal })) } catch (sErr) { console.info(TAG, 'balance before deduction tx (fresh read)', { uid, totalToDeduct, balance: curVal }) }
         } catch (dbgErr) {
             console.warn(TAG, 'failed to perform debug balance read', dbgErr)
         }
 
         const txRes = await transactionWithReadGuard(balanceRef, (cur: number) => {
-            if (cur < feeSol) return undefined
-            return cur - feeSol
-        }, { attempts: 6, backoffMs: 50, tag: 'fee_collection' })
+            if (cur < totalToDeduct) return undefined
+            return cur - totalToDeduct
+        }, { attempts: 6, backoffMs: 50, tag: 'collateral_and_fee_deduction' })
 
         if (!txRes || !(txRes as any).committed) {
-            throw new Error('insufficient_balance_for_fee')
+            // Read current balance to include in the error for debugging/client handling
+            let curVal: any = null
+            try {
+                const curSnap = await balanceRef.get()
+                curVal = curSnap.exists() ? curSnap.val() : null
+            } catch { /* ignore */ }
+
+            try { console.warn(TAG, 'collateral+fee deduction failed - current balance', JSON.stringify({ uid, curVal, required: totalToDeduct })) } catch (e) { console.warn(TAG, 'collateral+fee deduction failed - current balance', { uid, curVal, required: totalToDeduct }) }
+
+            const err: any = new Error('insufficient_balance')
+            err.feeBreak = feeBreak
+            err.currentBalance = curVal
+            err.required = totalToDeduct
+            throw err
         }
 
         const db = getAdminDb()
@@ -291,7 +407,8 @@ export async function openLong(uid: string, mint: string, collateralSol: number,
     }
 
     await getAdminDb().ref().update(updates)
-    return { ok: true, posId, position }
+    // Return fee breakdown and distribution so clients can display/record fees
+    return { ok: true, posId, position, feeBreak, distrib }
 }
 
 export default { createVault, creatorDeposit, contributorDeposit, openLong }
