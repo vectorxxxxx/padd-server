@@ -197,6 +197,17 @@ export async function openLong(uid: string, mint: string, collateralSol: number,
         // transaction below to fail if the balance is insufficient instead
         // of performing a pre-check here which can introduce race conditions.
 
+        // Debug: log fee breakdown and a fresh balance read so we can inspect
+        // exact values leading to any `insufficient_balance_for_fee` errors.
+        try {
+            console.info(TAG, 'feeBreak', feeBreak)
+            const curSnap = await balanceRef.get()
+            const curVal = curSnap.exists() ? curSnap.val() : null
+            console.info(TAG, 'balance before fee tx (fresh read)', { uid, feeSol, balance: curVal })
+        } catch (dbgErr) {
+            console.warn(TAG, 'failed to perform debug balance read', dbgErr)
+        }
+
         const txRes = await transactionWithReadGuard(balanceRef, (cur: number) => {
             if (cur < feeSol) return undefined
             return cur - feeSol
