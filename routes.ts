@@ -155,21 +155,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // (GMGN proxy removed) - frontend will use the regular client-side embed.
-  res.json({
-    success: true,
-    signature,
-    newBalance: newBalanceInSol,
-    explorerUrl: `https://explorer.solana.com/tx/${signature}?cluster=devnet`
-  });
-} catch (error) {
-  console.error("Error withdrawing SOL:", error);
-  res.status(500).json({
-    message: "Failed to withdraw SOL",
-    error: error instanceof Error ? error.message : "Unknown error"
-  });
-}
-  });
-
 // ========== MULTI-WALLET MANAGEMENT ENDPOINTS ==========
 
 // List all wallets for authenticated user
