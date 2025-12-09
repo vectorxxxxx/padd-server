@@ -974,6 +974,81 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Get user info (try local storage then Firebase admin). Supports:
+  // - `/api/users/:id` (path param)
+  // - `/api/users/profile?uid=...` (query param used by some clients)
+  app.get('/api/users/profile', async (req, res) => {
+    try {
+      const uid = (req.query && (req.query.uid || req.query.id)) as string | undefined;
+      if (!uid) return res.status(400).json({ success: false, error: 'uid required' });
+
+      // Reuse same lookup flow as the path-based handler below: try local storage then Firebase
+      try {
+        const user = await storage.getUser(uid);
+        if (user) {
+          const username = `${user.firstName || ''}${user.lastName ? ' ' + user.lastName : ''}`.trim() || user.email || user.id;
+          return res.json({ success: true, data: { id: user.id, username } });
+        }
+      } catch (e) {
+        // continue to firebase fallback
+      }
+
+      try {
+        if (!admin.apps || admin.apps.length === 0) {
+          try {
+            const loadSvc = () => {
+              const rawJson = process.env.SERVICE_ACCOUNT_JSON || process.env.FIREBASE_SERVICE_ACCOUNT;
+              if (rawJson) {
+                try { return JSON.parse(rawJson); } catch (e) { /* fallthrough */ }
+              }
+              const b64 = process.env.SERVICE_ACCOUNT_BASE64 || process.env.SERVICEACC_B64 || process.env.SERVICE_JSON_B64;
+              if (b64) {
+                try { return JSON.parse(Buffer.from(b64, 'base64').toString('utf8')); } catch (e) { }
+              }
+              try {
+                return require('../serviceacc.json');
+              } catch (e) {
+                return null;
+              }
+            };
+
+            const svc = loadSvc();
+            if (svc) {
+              admin.initializeApp({ credential: admin.credential.cert(svc as any), databaseURL: process.env.FIREBASE_DATABASE_URL });
+            } else {
+              try { admin.initializeApp(); } catch { }
+            }
+          } catch (e) {
+            try { admin.initializeApp(); } catch { }
+          }
+        }
+
+        // First try Realtime Database users/{uid}/username
+        try {
+          if (typeof admin.database === 'function') {
+            const db = admin.database();
+            const snap = await db.ref(`users/${uid}/username`).get();
+            if (snap && snap.exists()) {
+              const username = snap.val();
+              return res.json({ success: true, data: { id: uid, username } });
+            }
+          }
+        } catch (dbErr) {
+          console.warn('/api/users/profile rtdb read failed', dbErr);
+        }
+
+        const f = await admin.auth().getUser(uid);
+        const username = f.displayName || f.email || f.uid;
+        return res.json({ success: true, data: { id: f.uid, username } });
+      } catch (fbErr) {
+        return res.status(404).json({ success: false, error: 'user_not_found' });
+      }
+    } catch (err) {
+      console.error('/api/users/profile error', err);
+      return res.status(500).json({ success: false, error: 'server_error' });
+    }
+  });
+
   // Get user info (try local storage then Firebase admin). Returns { id, username }
   app.get('/api/users/:id', async (req, res) => {
     try {
@@ -1064,6 +1139,99 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Register launchpad routes
   // Close long position (calls shared engine implementation in padd-ui)
   // Uses server `priceService` as the authoritative source for SOL price (no other fallback for SOL).
+  // Open long position - uses same auth flow and price sourcing as close-long
+  app.post('/api/engine/open-long', async (req: any, res) => {
+    try {
+      console.log('[API][ENGINE][OPEN_LONG] incoming request', { path: req.path });
+      let uid: string | undefined | null = undefined;
+      if (req.isAuthenticated && typeof req.isAuthenticated === 'function' && req.isAuthenticated()) {
+        uid = req.user?.claims?.sub || req.user?.id;
+        console.log('[API][ENGINE][OPEN_LONG] session auth detected', { uid });
+      } else {
+        const auth = (req.headers?.authorization || '') as string;
+        if (auth.startsWith('Bearer ')) {
+          const idToken = auth.replace('Bearer ', '');
+          try {
+            if (!admin.apps || admin.apps.length === 0) {
+              try {
+                const loadSvc = () => {
+                  const rawJson = process.env.SERVICE_ACCOUNT_JSON || process.env.FIREBASE_SERVICE_ACCOUNT;
+                  if (rawJson) {
+                    try { return JSON.parse(rawJson); } catch (e) { }
+                  }
+                  const b64 = process.env.SERVICE_ACCOUNT_BASE64 || process.env.SERVICEACC_B64 || process.env.SERVICE_JSON_B64;
+                  if (b64) {
+                    try { return JSON.parse(Buffer.from(b64, 'base64').toString('utf8')); } catch (e) { }
+                  }
+                  try { return require('../serviceacc.json'); } catch (e) { return null; }
+                };
+                const svc = loadSvc();
+                if (svc) {
+                  admin.initializeApp({ credential: admin.credential.cert(svc as any) });
+                } else {
+                  try { admin.initializeApp(); } catch { }
+                }
+              } catch (e) {
+                try { admin.initializeApp(); } catch { }
+              }
+            }
+            const decoded = await admin.auth().verifyIdToken(idToken);
+            uid = decoded?.uid;
+            console.log('[API][ENGINE][OPEN_LONG] firebase token verified', { uid });
+          } catch (e) {
+            console.error('[API][ENGINE][OPEN_LONG] Firebase token verification failed', e);
+            uid = null;
+          }
+        }
+      }
+
+      // Allow wallet-session fallback
+      if (!uid && req.session && req.session.user) {
+        uid = req.session.user.id || req.session.user?.publicKey || null;
+        console.log('[API][ENGINE][OPEN_LONG] wallet-session detected', { uid });
+      }
+
+      // Allow client to provide `userId` when no session or idToken is present
+      if (!uid && req.body && req.body.userId) {
+        uid = String(req.body.userId);
+        console.log('[API][ENGINE][OPEN_LONG] using userId from body as uid', { uid });
+      }
+
+      if (!uid) return res.status(401).json({ success: false, error: 'unauthenticated' });
+
+      const { mint, collateralSol, leverageBps, entryPriceUsd: bodyEntry, solPriceUsd: bodySol } = req.body || {};
+      const coll = Number(collateralSol);
+      const lever = Number(leverageBps);
+      if (!mint || !Number.isFinite(coll) || coll <= 0 || !Number.isFinite(lever) || lever <= 0) {
+        return res.status(400).json({ success: false, error: 'mint, collateralSol and leverageBps required' });
+      }
+
+      // Fetch authoritative SOL price
+      const solPriceData = priceService.getPrice('SOL');
+      if (!solPriceData || typeof solPriceData.price !== 'number' || solPriceData.price <= 0) {
+        console.error('[API][ENGINE][OPEN_LONG] SOL price unavailable from priceService', { solPriceData });
+        return res.status(503).json({ success: false, error: 'sol_price_unavailable' });
+      }
+      const solPriceUsd = solPriceData.price;
+
+      const engine = await import('./lib/engine');
+      if (!engine || typeof engine.openLong !== 'function') {
+        return res.status(500).json({ success: false, error: 'engine.openLong unavailable' });
+      }
+
+      const opts: any = {};
+      if (bodyEntry != null) opts.entryPriceUsd = Number(bodyEntry);
+      if (bodySol != null) opts.solPriceUsd = Number(bodySol);
+      // Pass authoritative solPrice if not provided
+      if (opts.solPriceUsd == null) opts.solPriceUsd = solPriceUsd;
+
+      const result = await engine.openLong(String(uid), String(mint), coll, lever, opts);
+      return res.json(result);
+    } catch (err: any) {
+      console.error('/api/engine/open-long error', err);
+      return res.status(500).json({ success: false, error: err?.message || String(err) });
+    }
+  });
   app.post("/api/engine/close-long", async (req: any, res) => {
     try {
       console.log('[API][ENGINE][CLOSE_LONG] incoming request', { path: req.path, headers: Object.keys(req.headers || {}).filter(k => ['authorization', 'host', 'content-type'].includes(k.toLowerCase())) });
