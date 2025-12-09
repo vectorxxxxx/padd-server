@@ -2,12 +2,12 @@ import { Connection, LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
 import type { Express } from "express";
 import admin from 'firebase-admin';
 import { createServer, type Server } from "http";
-import * as balanceTx from './lib/balanceTx';
-import adminHelper from './lib/firebaseAdmin';
 import { gmgnService } from "./gmgnService";
 import { jupiterService } from "./jupiterService";
 import { jupiterTopTrendingService } from "./jupiterTopTrendingService";
 import launchpadRoutes from "./launchpadRoutes";
+import * as balanceTx from './lib/balanceTx';
+import adminHelper from './lib/firebaseAdmin';
 import { priceService } from "./priceService";
 import { isAuthenticated, setupAuth } from "./replitAuth";
 import { fetchChartCandles } from "./services/chartService";
@@ -1163,7 +1163,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // Import the engine implementation from the frontend package so we share logic
-      const engine = await import('../padd-ui/engine/engine');
+      const engine = await import('./lib/engine');
       if (!engine || typeof engine.closeLong !== 'function') {
         return res.status(500).json({ success: false, error: 'engine.closeLong unavailable' });
       }
@@ -1267,7 +1267,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
       }
 
-      const engine = await import('../padd-ui/engine/engine');
+      const engine = await import('./lib/engine');
       if (!engine || typeof engine.createVault !== 'function') {
         // If we deducted above, attempt to refund
         if (initialSol > 0) {
@@ -1421,7 +1421,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(500).json({ success: false, error: deductErr?.message || String(deductErr) });
       }
 
-      const engine = await import('../padd-ui/engine/engine');
+      const engine = await import('./lib/engine');
       if (!engine) return res.status(500).json({ success: false, error: 'engine unavailable' });
 
       try {
