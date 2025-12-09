@@ -1345,6 +1345,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // List vaults - returns all vaults stored in the admin Realtime Database
+  app.get('/api/engine/vaults/list', async (_req: any, res) => {
+    try {
+      const db = getAdminDb();
+      const snap = await db.ref('/vaults').get();
+      const vaults = snap && snap.exists() ? snap.val() : {};
+      return res.json({ success: true, vaults });
+    } catch (err: any) {
+      console.error('/api/engine/vaults/list error', err);
+      return res.status(500).json({ success: false, error: err?.message || String(err) });
+    }
+  });
+
   // Create a new vault (PADD) - accept session auth, Firebase idToken, or wallet-session
   app.post("/api/engine/vaults/create", async (req: any, res) => {
     try {

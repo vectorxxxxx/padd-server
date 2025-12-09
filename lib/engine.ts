@@ -193,13 +193,9 @@ export async function openLong(uid: string, mint: string, collateralSol: number,
             console.warn(TAG, 'failed to read balance before fee tx', readErr)
         }
 
-        const snapAfter = await balanceRef.get()
-        const balValAfter = snapAfter.exists() ? snapAfter.val() : null
-        const balNumAfter = coerceNum(balValAfter)
-
-        if (!Number.isFinite(balNumAfter) || balNumAfter < feeSol) {
-            throw new Error('insufficient_balance_for_fee')
-        }
+        // NOTE: client will perform balance validation. Rely on the atomic
+        // transaction below to fail if the balance is insufficient instead
+        // of performing a pre-check here which can introduce race conditions.
 
         const txRes = await transactionWithReadGuard(balanceRef, (cur: number) => {
             if (cur < feeSol) return undefined
