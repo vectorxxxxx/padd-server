@@ -1632,10 +1632,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
           }
         }
       }
-      const { vaultId, mint, posId, uid: bodyUid, markUsd: bodyMark } = req.body || {};
+      const { vaultId, mint, posId, uid: bodyUid, currentValueSol: bodyCurrentValueSol, markUsd: bodyMark } = req.body || {};
       // Support both vaultId (new) and mint (legacy) - vaultId takes precedence
       const resolvedVaultId = vaultId || mint;
-      
+
       // If Firebase auth failed or wasn't provided, fall back to uid from body (wallet pubkey)
       if (!uid && bodyUid) {
         uid = bodyUid;
@@ -1645,13 +1645,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!uid) return res.status(401).json({ success: false, error: 'unauthenticated' });
       if (!resolvedVaultId || !posId) return res.status(400).json({ success: false, error: 'vaultId and posId are required' });
 
-      // Fetch SOL price from our in-process price service and treat it as authoritative
-      const solPriceData = priceService.getPrice('SOL');
-      if (!solPriceData || typeof solPriceData.price !== 'number' || solPriceData.price <= 0) {
-        console.error('[API][ENGINE][CLOSE_LONG] SOL price unavailable from priceService', { solPriceData });
-        return res.status(503).json({ success: false, error: 'sol_price_unavailable' });
+      // Validate currentValueSol from frontend
+      const currentValueSol = typeof bodyCurrentValueSol === 'number' && Number.isFinite(bodyCurrentValueSol) && bodyCurrentValueSol >= 0
+        ? bodyCurrentValueSol
+        : null;
+
+      if (currentValueSol === null) {
+        return res.status(400).json({ success: false, error: 'currentValueSol is required' });
       }
-      const solPriceUsd = solPriceData.price;
+
+      // Fetch SOL price from our in-process price service (for logging/reference)
+      const solPriceData = priceService.getPrice('SOL');
+      const solPriceUsd = solPriceData?.price ?? null;
 
       // Allow the frontend to provide `markUsd` directly (the page already shows the token price).
       // If not provided, fall back to GMGN lookup as before.
@@ -1707,8 +1712,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(500).json({ success: false, error: 'engine.closeLong unavailable' });
       }
 
-      // Pass server-provided SOL and mark prices explicitly so engine uses them
-      const result = await engine.closeLong(uid, resolvedVaultId, posId, { liquidated: false, solPriceUsd, markUsd: markUsd ?? undefined });
+      // Pass currentValueSol from frontend - this is the source of truth for PnL calculation
+      const result = await engine.closeLong(uid, resolvedVaultId, posId, {
+        liquidated: false,
+        currentValueSol,
+        solPriceUsd: solPriceUsd ?? undefined,
+        markUsd: markUsd ?? undefined
+      });
       return res.json(result);
     } catch (err: any) {
       console.error('/api/engine/close-long error', err);

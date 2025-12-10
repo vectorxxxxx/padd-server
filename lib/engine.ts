@@ -411,7 +411,7 @@ export async function openLong(uid: string, mint: string, collateralSol: number,
     return { ok: true, posId, position, feeBreak, distrib }
 }
 
-export async function closeLong(uid: string, vaultId: string, posId: string, opts?: { liquidated?: boolean, solPriceUsd?: number, markUsd?: number }) {
+export async function closeLong(uid: string, vaultId: string, posId: string, opts?: { liquidated?: boolean, currentValueSol?: number, solPriceUsd?: number, markUsd?: number }) {
     const db = getAdminDb()
     const liquidated = opts?.liquidated ?? false
 
@@ -426,87 +426,22 @@ export async function closeLong(uid: string, vaultId: string, posId: string, opt
         throw new Error('position_not_open')
     }
 
-    // 2. Get prices
-    let solPriceUsd = opts?.solPriceUsd ?? null
-    let markUsd = opts?.markUsd ?? null
+    // 2. Validate currentValueSol from frontend (required)
+    const currentValueSol = opts?.currentValueSol
+    if (typeof currentValueSol !== 'number' || !Number.isFinite(currentValueSol) || currentValueSol < 0) {
+        throw new Error('currentValueSol_required')
+    }
 
-    // Determine token mint from vault
-    let tokenMint: string = vaultId
+    // Get vault for reference
     const vaultSnap = await db.ref(`/vaults/${vaultId}`).get()
     if (!vaultSnap.exists()) {
         throw new Error('vault_not_found')
     }
-    const vault = vaultSnap.val()
-    if (vault && vault.tokenMint) tokenMint = vault.tokenMint
-
-    // Fetch prices from cache if not provided
-    if (solPriceUsd == null) {
-        const solSnap = await db.ref(`/price_cache/WSOL_MINT`).get()
-        solPriceUsd = solSnap.exists() ? solSnap.val().priceUsd : null
-    }
-    if (markUsd == null) {
-        const priceSnap = await db.ref(`/price_cache/${tokenMint}`).get()
-        markUsd = priceSnap.exists() ? priceSnap.val().priceUsd : null
-    }
-    if (!solPriceUsd || !markUsd) {
-        throw new Error('prices_unavailable')
-    }
 
     const { collateralSol, borrowSol, sizeToken, entryPriceUsd } = position
+    const notionalSol = collateralSol + borrowSol  // Original position size in SOL
 
-    // 3. Calculate current value in SOL
-    // currentValueUsd = sizeToken * markUsd
-    // currentValueSol = currentValueUsd / solPriceUsd
-    const currentValueUsd = sizeToken * markUsd
-    const currentValueSol = currentValueUsd / solPriceUsd
-
-    // 4. Calculate PnL (remaining - collateral)
-    // remainingSol is what the trader gets after returning borrow
-    // Since trader "owns" sizeToken, the value is currentValueSol
-    // PnL = currentValueSol - (collateralSol + borrowSol) but we need to return borrowSol to vault
-    // So: remainingSol = currentValueSol - borrowSol (what's left after returning borrow)
-    // pnlSol = remainingSol - collateralSol
-    const remainingSol = currentValueSol - borrowSol
-    const pnlSol = remainingSol - collateralSol
-
-    console.info(TAG, 'closeLong calculation', {
-        uid, vaultId, posId,
-        sizeToken, markUsd, solPriceUsd,
-        currentValueSol, borrowSol, collateralSol,
-        remainingSol, pnlSol
-    })
-
-    // 5. Calculate fees (only from positive PnL)
-    let creatorFeeSol = 0
-    let platformFeeSol = 0
-    let userPayoutSol = remainingSol  // Start with remaining after returning borrow
-
-    if (pnlSol > 0) {
-        // 10% of PnL goes to creator
-        creatorFeeSol = pnlSol * 0.10
-        // 5% of PnL goes to platform
-        platformFeeSol = pnlSol * 0.05
-        // User gets remaining (85% of PnL + original collateral)
-        userPayoutSol = remainingSol - creatorFeeSol - platformFeeSol
-    }
-    // If pnlSol <= 0, no fees taken, user just gets remainingSol (could be less than collateral)
-
-    console.info(TAG, 'closeLong fees', {
-        pnlSol, creatorFeeSol, platformFeeSol, userPayoutSol,
-        pnlPositive: pnlSol > 0
-    })
-
-    // 6. Update position status to CLOSED
-    await db.ref(posPath).update({
-        status: 'CLOSED',
-        closedAt: now(),
-        closeMarkUsd: markUsd,
-        closeSolPriceUsd: solPriceUsd,
-        realizedPnlSol: pnlSol,
-        liquidated
-    })
-
-    // 7. Return borrowed SOL to vault TVL
+    // 3. Return borrowed SOL to vault first
     const vaultRef = db.ref(`/vaults/${vaultId}`)
     await vaultRef.transaction((v: any) => {
         if (v == null) return v
@@ -518,7 +453,36 @@ export async function closeLong(uid: string, vaultId: string, posId: string, opt
         return v
     })
 
-    // 8. Add creator fee to vault's feesForCreator
+    // 4. Calculate PnL: currentValueSol - notionalSol (what was originally put in)
+    const pnlSol = currentValueSol - notionalSol
+
+    console.info(TAG, 'closeLong calculation', {
+        uid, vaultId, posId,
+        currentValueSol, notionalSol, collateralSol, borrowSol,
+        pnlSol
+    })
+
+    // 5. Calculate fees (only from positive PnL)
+    let creatorFeeSol = 0
+    let platformFeeSol = 0
+    let userPayoutSol = currentValueSol  // Start with full current value
+
+    if (pnlSol > 0) {
+        // 10% of PnL goes to creator
+        creatorFeeSol = pnlSol * 0.10
+        // 5% of PnL goes to platform
+        platformFeeSol = pnlSol * 0.05
+        // User gets currentValue minus fees
+        userPayoutSol = currentValueSol - creatorFeeSol - platformFeeSol
+    }
+    // If pnlSol <= 0, no fees taken, user just gets currentValueSol (could be less than collateral)
+
+    console.info(TAG, 'closeLong fees', {
+        pnlSol, creatorFeeSol, platformFeeSol, userPayoutSol,
+        pnlPositive: pnlSol > 0
+    })
+
+    // 6. Add creator fee to vault's feesForCreator
     if (creatorFeeSol > 0) {
         const creatorFeeRef = db.ref(`/vaults/${vaultId}/feesForCreator`)
         await creatorFeeRef.transaction((curr: any) => {
@@ -527,7 +491,7 @@ export async function closeLong(uid: string, vaultId: string, posId: string, opt
         })
     }
 
-    // 9. Add platform fee to treasury
+    // 7. Add platform fee to treasury
     if (platformFeeSol > 0) {
         const platformRef = db.ref(`/platform/treasury/fees`)
         await platformRef.transaction((curr: any) => {
@@ -536,7 +500,7 @@ export async function closeLong(uid: string, vaultId: string, posId: string, opt
         })
     }
 
-    // 10. Credit user balance with remaining SOL
+    // 8. Credit user balance with payout (currentValue minus fees)
     if (userPayoutSol > 0) {
         const balanceRef = db.ref(`/users/${uid}/balance`)
         await balanceRef.transaction((curr: any) => {
@@ -545,7 +509,18 @@ export async function closeLong(uid: string, vaultId: string, posId: string, opt
         })
     }
 
-    // 11. Record trade
+    // 9. Update position status to CLOSED
+    await db.ref(posPath).update({
+        status: 'CLOSED',
+        closedAt: now(),
+        closeMarkUsd: opts?.markUsd ?? null,
+        closeSolPriceUsd: opts?.solPriceUsd ?? null,
+        currentValueSol,
+        realizedPnlSol: pnlSol,
+        liquidated
+    })
+
+    // 10. Record trade
     const tradeId = uuidv4()
     await db.ref(`/trades/${vaultId}/${tradeId}`).set({
         uid,
@@ -555,8 +530,9 @@ export async function closeLong(uid: string, vaultId: string, posId: string, opt
         borrowedSol: borrowSol,
         sizeToken,
         entryPriceUsd,
-        closeMarkUsd: markUsd,
-        closeSolPriceUsd: solPriceUsd,
+        currentValueSol,
+        closeMarkUsd: opts?.markUsd ?? null,
+        closeSolPriceUsd: opts?.solPriceUsd ?? null,
         pnlSol,
         creatorFeeSol,
         platformFeeSol,
@@ -564,7 +540,7 @@ export async function closeLong(uid: string, vaultId: string, posId: string, opt
         ts: now()
     })
 
-    // 12. Record fee entry
+    // 11. Record fee entry
     const feeId = uuidv4()
     await db.ref(`/fees/${feeId}`).set({
         tradeId,
@@ -575,24 +551,23 @@ export async function closeLong(uid: string, vaultId: string, posId: string, opt
         creatorFeeSol,
         platformFeeSol,
         userPayoutSol,
-        usedSolPrice: solPriceUsd,
+        usedSolPrice: opts?.solPriceUsd ?? null,
         ts: now(),
         status: 'confirmed'
     })
 
     console.info(TAG, 'closeLong completed', {
-        uid, vaultId, posId, pnlSol, creatorFeeSol, platformFeeSol, userPayoutSol
+        uid, vaultId, posId, currentValueSol, pnlSol, creatorFeeSol, platformFeeSol, userPayoutSol
     })
 
     return {
         ok: true,
         posId,
+        currentValueSol,
         pnlSol,
         creatorFeeSol,
         platformFeeSol,
-        userPayoutSol,
-        markUsd,
-        solPriceUsd
+        userPayoutSol
     }
 }
 
