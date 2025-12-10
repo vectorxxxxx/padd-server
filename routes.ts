@@ -1588,7 +1588,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.post("/api/engine/close-long", async (req: any, res) => {
     try {
       console.log('[API][ENGINE][CLOSE_LONG] incoming request', { path: req.path, headers: Object.keys(req.headers || {}).filter(k => ['authorization', 'host', 'content-type'].includes(k.toLowerCase())) });
-      // Allow either session-based auth (passport) OR a Firebase ID token in Authorization: Bearer <idToken>
+      // Allow either session-based auth (passport), Firebase ID token, OR wallet pubkey in body
       let uid: string | undefined | null = undefined;
       if (req.isAuthenticated && typeof req.isAuthenticated === 'function' && req.isAuthenticated()) {
         uid = req.user?.claims?.sub || req.user?.id;
@@ -1628,13 +1628,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
             console.log('[API][ENGINE][CLOSE_LONG] firebase token verified', { uid });
           } catch (e) {
             console.error('[API][ENGINE][CLOSE_LONG] Firebase token verification failed', e);
-            uid = null;
+            // Don't set uid to null yet - check body.uid below
           }
         }
       }
-      const { vaultId, mint, posId, markUsd: bodyMark } = req.body || {};
+      const { vaultId, mint, posId, uid: bodyUid, markUsd: bodyMark } = req.body || {};
       // Support both vaultId (new) and mint (legacy) - vaultId takes precedence
       const resolvedVaultId = vaultId || mint;
+      
+      // If Firebase auth failed or wasn't provided, fall back to uid from body (wallet pubkey)
+      if (!uid && bodyUid) {
+        uid = bodyUid;
+        console.log('[API][ENGINE][CLOSE_LONG] using wallet pubkey from body as uid', { uid });
+      }
 
       if (!uid) return res.status(401).json({ success: false, error: 'unauthenticated' });
       if (!resolvedVaultId || !posId) return res.status(400).json({ success: false, error: 'vaultId and posId are required' });
