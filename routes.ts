@@ -2021,6 +2021,70 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Claim fees endpoint
+  app.post('/api/engine/vaults/claim-fees', async (req: any, res) => {
+    try {
+      const { vaultId, uid } = req.body;
+
+      if (!vaultId || !uid) {
+        return res.status(400).json({ success: false, error: 'vaultId and uid are required' });
+      }
+
+      console.log('[API][ENGINE][CLAIM_FEES] request', { vaultId, uid });
+
+      const db = getAdminDb();
+
+      // Get vault and verify user is the creator
+      const vaultRef = db.ref(`/vaults/${vaultId}`);
+      const vaultSnap = await vaultRef.once('value');
+      const vault = vaultSnap.val();
+
+      if (!vault) {
+        return res.status(404).json({ success: false, error: 'Vault not found' });
+      }
+
+      const creatorUid = vault?.composition?.creatorUid || vault?.creatorUid;
+      if (creatorUid !== uid) {
+        return res.status(403).json({ success: false, error: 'Only vault creator can claim fees' });
+      }
+
+      const feesForCreator = Number(vault.feesForCreator) || 0;
+      if (feesForCreator <= 0) {
+        return res.status(400).json({ success: false, error: 'No fees to claim' });
+      }
+
+      console.log('[API][ENGINE][CLAIM_FEES] claiming fees', { vaultId, uid, feesForCreator });
+
+      // Add fees to user balance
+      const balanceRef = db.ref(`/users/${uid}/balance`);
+      await balanceTx.transactionWithReadGuard(
+        balanceRef,
+        (cur) => {
+          const currentBalance = Number(cur) || 0;
+          return currentBalance + feesForCreator;
+        },
+        { attempts: 6, backoffMs: 50, tag: 'claim_fees' }
+      );
+
+      console.log('[API][ENGINE][CLAIM_FEES] added fees to user balance', { uid, feesForCreator });
+
+      // Reset feesForCreator to 0 in vault
+      await vaultRef.child('feesForCreator').set(0);
+      console.log('[API][ENGINE][CLAIM_FEES] reset vault feesForCreator to 0', { vaultId });
+
+      return res.json({
+        success: true,
+        claimed: feesForCreator,
+        vaultId,
+        uid
+      });
+
+    } catch (err: any) {
+      console.error('[API][ENGINE][CLAIM_FEES] error', err);
+      return res.status(500).json({ success: false, error: err?.message || String(err) });
+    }
+  });
+
   app.use("/api/launchpad", launchpadRoutes);
 
   const httpServer = createServer(app);
