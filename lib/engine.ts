@@ -411,4 +411,189 @@ export async function openLong(uid: string, mint: string, collateralSol: number,
     return { ok: true, posId, position, feeBreak, distrib }
 }
 
-export default { createVault, creatorDeposit, contributorDeposit, openLong }
+export async function closeLong(uid: string, vaultId: string, posId: string, opts?: { liquidated?: boolean, solPriceUsd?: number, markUsd?: number }) {
+    const db = getAdminDb()
+    const liquidated = opts?.liquidated ?? false
+
+    // 1. Fetch position
+    const posPath = `/positions/${uid}/${vaultId}/${posId}`
+    const posSnap = await db.ref(posPath).get()
+    if (!posSnap.exists()) {
+        throw new Error('position_not_found')
+    }
+    const position = posSnap.val()
+    if (position.status !== 'OPEN') {
+        throw new Error('position_not_open')
+    }
+
+    // 2. Get prices
+    let solPriceUsd = opts?.solPriceUsd ?? null
+    let markUsd = opts?.markUsd ?? null
+
+    // Determine token mint from vault
+    let tokenMint: string = vaultId
+    const vaultSnap = await db.ref(`/vaults/${vaultId}`).get()
+    if (!vaultSnap.exists()) {
+        throw new Error('vault_not_found')
+    }
+    const vault = vaultSnap.val()
+    if (vault && vault.tokenMint) tokenMint = vault.tokenMint
+
+    // Fetch prices from cache if not provided
+    if (solPriceUsd == null) {
+        const solSnap = await db.ref(`/price_cache/WSOL_MINT`).get()
+        solPriceUsd = solSnap.exists() ? solSnap.val().priceUsd : null
+    }
+    if (markUsd == null) {
+        const priceSnap = await db.ref(`/price_cache/${tokenMint}`).get()
+        markUsd = priceSnap.exists() ? priceSnap.val().priceUsd : null
+    }
+    if (!solPriceUsd || !markUsd) {
+        throw new Error('prices_unavailable')
+    }
+
+    const { collateralSol, borrowSol, sizeToken, entryPriceUsd } = position
+
+    // 3. Calculate current value in SOL
+    // currentValueUsd = sizeToken * markUsd
+    // currentValueSol = currentValueUsd / solPriceUsd
+    const currentValueUsd = sizeToken * markUsd
+    const currentValueSol = currentValueUsd / solPriceUsd
+
+    // 4. Calculate PnL (remaining - collateral)
+    // remainingSol is what the trader gets after returning borrow
+    // Since trader "owns" sizeToken, the value is currentValueSol
+    // PnL = currentValueSol - (collateralSol + borrowSol) but we need to return borrowSol to vault
+    // So: remainingSol = currentValueSol - borrowSol (what's left after returning borrow)
+    // pnlSol = remainingSol - collateralSol
+    const remainingSol = currentValueSol - borrowSol
+    const pnlSol = remainingSol - collateralSol
+
+    console.info(TAG, 'closeLong calculation', {
+        uid, vaultId, posId,
+        sizeToken, markUsd, solPriceUsd,
+        currentValueSol, borrowSol, collateralSol,
+        remainingSol, pnlSol
+    })
+
+    // 5. Calculate fees (only from positive PnL)
+    let creatorFeeSol = 0
+    let platformFeeSol = 0
+    let userPayoutSol = remainingSol  // Start with remaining after returning borrow
+
+    if (pnlSol > 0) {
+        // 10% of PnL goes to creator
+        creatorFeeSol = pnlSol * 0.10
+        // 5% of PnL goes to platform
+        platformFeeSol = pnlSol * 0.05
+        // User gets remaining (85% of PnL + original collateral)
+        userPayoutSol = remainingSol - creatorFeeSol - platformFeeSol
+    }
+    // If pnlSol <= 0, no fees taken, user just gets remainingSol (could be less than collateral)
+
+    console.info(TAG, 'closeLong fees', {
+        pnlSol, creatorFeeSol, platformFeeSol, userPayoutSol,
+        pnlPositive: pnlSol > 0
+    })
+
+    // 6. Update position status to CLOSED
+    await db.ref(posPath).update({
+        status: 'CLOSED',
+        closedAt: now(),
+        closeMarkUsd: markUsd,
+        closeSolPriceUsd: solPriceUsd,
+        realizedPnlSol: pnlSol,
+        liquidated
+    })
+
+    // 7. Return borrowed SOL to vault TVL
+    const vaultRef = db.ref(`/vaults/${vaultId}`)
+    await vaultRef.transaction((v: any) => {
+        if (v == null) return v
+        // Add borrow back to TVL
+        v.tvlSol = (v.tvlSol || 0) + borrowSol
+        // Subtract from totalBorrowsSol
+        v.totalBorrowsSol = Math.max(0, (v.totalBorrowsSol || 0) - borrowSol)
+        v.updatedAt = now()
+        return v
+    })
+
+    // 8. Add creator fee to vault's feesForCreator
+    if (creatorFeeSol > 0) {
+        const creatorFeeRef = db.ref(`/vaults/${vaultId}/feesForCreator`)
+        await creatorFeeRef.transaction((curr: any) => {
+            const cur = coerceNum(curr)
+            return cur + creatorFeeSol
+        })
+    }
+
+    // 9. Add platform fee to treasury
+    if (platformFeeSol > 0) {
+        const platformRef = db.ref(`/platform/treasury/fees`)
+        await platformRef.transaction((curr: any) => {
+            const cur = coerceNum(curr)
+            return cur + platformFeeSol
+        })
+    }
+
+    // 10. Credit user balance with remaining SOL
+    if (userPayoutSol > 0) {
+        const balanceRef = db.ref(`/users/${uid}/balance`)
+        await balanceRef.transaction((curr: any) => {
+            const cur = coerceNum(curr)
+            return cur + userPayoutSol
+        })
+    }
+
+    // 11. Record trade
+    const tradeId = uuidv4()
+    await db.ref(`/trades/${vaultId}/${tradeId}`).set({
+        uid,
+        type: liquidated ? 'LIQUIDATE' : 'CLOSE LONG',
+        posId,
+        collateralSol,
+        borrowedSol: borrowSol,
+        sizeToken,
+        entryPriceUsd,
+        closeMarkUsd: markUsd,
+        closeSolPriceUsd: solPriceUsd,
+        pnlSol,
+        creatorFeeSol,
+        platformFeeSol,
+        userPayoutSol,
+        ts: now()
+    })
+
+    // 12. Record fee entry
+    const feeId = uuidv4()
+    await db.ref(`/fees/${feeId}`).set({
+        tradeId,
+        event: liquidated ? 'LIQUIDATE' : 'CLOSE',
+        uid,
+        vaultId,
+        pnlSol,
+        creatorFeeSol,
+        platformFeeSol,
+        userPayoutSol,
+        usedSolPrice: solPriceUsd,
+        ts: now(),
+        status: 'confirmed'
+    })
+
+    console.info(TAG, 'closeLong completed', {
+        uid, vaultId, posId, pnlSol, creatorFeeSol, platformFeeSol, userPayoutSol
+    })
+
+    return {
+        ok: true,
+        posId,
+        pnlSol,
+        creatorFeeSol,
+        platformFeeSol,
+        userPayoutSol,
+        markUsd,
+        solPriceUsd
+    }
+}
+
+export default { createVault, creatorDeposit, contributorDeposit, openLong, closeLong }

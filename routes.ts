@@ -1632,10 +1632,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
           }
         }
       }
-      const { mint, posId, markUsd: bodyMark } = req.body || {};
+      const { vaultId, mint, posId, markUsd: bodyMark } = req.body || {};
+      // Support both vaultId (new) and mint (legacy) - vaultId takes precedence
+      const resolvedVaultId = vaultId || mint;
 
       if (!uid) return res.status(401).json({ success: false, error: 'unauthenticated' });
-      if (!mint || !posId) return res.status(400).json({ success: false, error: 'mint and posId are required' });
+      if (!resolvedVaultId || !posId) return res.status(400).json({ success: false, error: 'vaultId and posId are required' });
 
       // Fetch SOL price from our in-process price service and treat it as authoritative
       const solPriceData = priceService.getPrice('SOL');
@@ -1655,8 +1657,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
       }
       if (markUsd == null) {
+        // Get token mint from vault for GMGN lookup
+        let tokenMintForLookup = resolvedVaultId;
         try {
-          const coins = await gmgnService.lookup(mint, 'sol');
+          const vaultSnap = await getAdminDb().ref(`/vaults/${resolvedVaultId}`).get();
+          if (vaultSnap.exists()) {
+            const vault = vaultSnap.val();
+            if (vault && vault.tokenMint) tokenMintForLookup = vault.tokenMint;
+          }
+        } catch { /* use resolvedVaultId as fallback */ }
+
+        try {
+          const coins = await gmgnService.lookup(tokenMintForLookup, 'sol');
           const coin = Array.isArray(coins) && coins.length ? coins[0] : null;
           if (coin) {
             const candidates = [
@@ -1679,7 +1691,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           console.warn('[API][ENGINE][CLOSE_LONG] gmgn lookup failed', gmgnErr);
         }
         if (!markUsd) {
-          console.warn('[API][ENGINE][CLOSE_LONG] token mark price unavailable from GMGN and no page-supplied price; falling back to cache/engine lookup', { mint, markUsd });
+          console.warn('[API][ENGINE][CLOSE_LONG] token mark price unavailable from GMGN and no page-supplied price; falling back to cache/engine lookup', { vaultId: resolvedVaultId, markUsd });
         }
       }
 
@@ -1690,7 +1702,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // Pass server-provided SOL and mark prices explicitly so engine uses them
-      const result = await engine.closeLong(uid, mint, posId, { liquidated: false, solPriceUsd, markUsd: markUsd ?? undefined });
+      const result = await engine.closeLong(uid, resolvedVaultId, posId, { liquidated: false, solPriceUsd, markUsd: markUsd ?? undefined });
       return res.json(result);
     } catch (err: any) {
       console.error('/api/engine/close-long error', err);
