@@ -426,9 +426,9 @@ export async function closeLong(uid: string, vaultId: string, posId: string, opt
         throw new Error('position_not_open')
     }
 
-    // 2. Validate currentValueSol from frontend (required)
-    const currentValueSol = opts?.currentValueSol
-    if (typeof currentValueSol !== 'number' || !Number.isFinite(currentValueSol) || currentValueSol < 0) {
+    // 2. Validate currentValueSol from frontend (required for normal close, optional for liquidation)
+    const currentValueSol = opts?.currentValueSol ?? 0
+    if (!liquidated && (typeof currentValueSol !== 'number' || !Number.isFinite(currentValueSol) || currentValueSol < 0)) {
         throw new Error('currentValueSol_required')
     }
 
@@ -441,7 +441,7 @@ export async function closeLong(uid: string, vaultId: string, posId: string, opt
     const { collateralSol, borrowSol, sizeToken, entryPriceUsd } = position
     const notionalSol = collateralSol + borrowSol  // Original position size in SOL
 
-    // 3. Return borrowed SOL to vault first
+    // 3. Return borrowed SOL to vault - ALWAYS happens regardless of liquidation
     const vaultRef = db.ref(`/vaults/${vaultId}`)
     await vaultRef.transaction((v: any) => {
         if (v == null) return v
@@ -453,63 +453,80 @@ export async function closeLong(uid: string, vaultId: string, posId: string, opt
         return v
     })
 
-    // 4. Calculate PnL: currentValueSol - notionalSol (what was originally put in)
-    const pnlSol = currentValueSol - notionalSol
-
-    console.info(TAG, 'closeLong calculation', {
-        uid, vaultId, posId,
-        currentValueSol, notionalSol, collateralSol, borrowSol,
-        pnlSol
-    })
-
-    // 5. Calculate fees (only from positive PnL)
+    // 4. Calculate PnL and handle payouts
+    let pnlSol = 0
     let creatorFeeSol = 0
     let platformFeeSol = 0
-    let userPayoutSol = currentValueSol  // Start with full current value
+    let userPayoutSol = 0
 
-    if (pnlSol > 0) {
-        // 10% of PnL goes to creator
-        creatorFeeSol = pnlSol * 0.10
-        // 5% of PnL goes to platform
-        platformFeeSol = pnlSol * 0.05
-        // User gets currentValue minus fees
-        userPayoutSol = currentValueSol - creatorFeeSol - platformFeeSol
-    }
-    // If pnlSol <= 0, no fees taken, user just gets currentValueSol (could be less than collateral)
+    if (liquidated) {
+        // LIQUIDATION: User loses everything, vault gets its borrow back (already done above)
+        // PnL is the full loss (negative of collateral since they lose it all)
+        pnlSol = -collateralSol
+        userPayoutSol = 0  // User gets nothing
 
-    console.info(TAG, 'closeLong fees', {
-        pnlSol, creatorFeeSol, platformFeeSol, userPayoutSol,
-        pnlPositive: pnlSol > 0
-    })
-
-    // 6. Add creator fee to vault's feesForCreator
-    if (creatorFeeSol > 0) {
-        const creatorFeeRef = db.ref(`/vaults/${vaultId}/feesForCreator`)
-        await creatorFeeRef.transaction((curr: any) => {
-            const cur = coerceNum(curr)
-            return cur + creatorFeeSol
+        console.info(TAG, 'closeLong LIQUIDATION', {
+            uid, vaultId, posId,
+            currentValueSol, borrowSol, collateralSol,
+            userLoss: collateralSol
         })
-    }
+    } else {
+        // NORMAL CLOSE: Calculate PnL and distribute
+        pnlSol = currentValueSol - notionalSol
 
-    // 7. Add platform fee to treasury
-    if (platformFeeSol > 0) {
-        const platformRef = db.ref(`/platform/treasury/fees`)
-        await platformRef.transaction((curr: any) => {
-            const cur = coerceNum(curr)
-            return cur + platformFeeSol
+        console.info(TAG, 'closeLong calculation', {
+            uid, vaultId, posId,
+            currentValueSol, notionalSol, collateralSol, borrowSol,
+            pnlSol
         })
-    }
 
-    // 8. Credit user balance with payout (currentValue minus fees)
-    if (userPayoutSol > 0) {
-        const balanceRef = db.ref(`/users/${uid}/balance`)
-        await balanceRef.transaction((curr: any) => {
-            const cur = coerceNum(curr)
-            return cur + userPayoutSol
+        // Calculate fees (only from positive PnL)
+        userPayoutSol = currentValueSol  // Start with full current value
+
+        if (pnlSol > 0) {
+            // 10% of PnL goes to creator
+            creatorFeeSol = pnlSol * 0.10
+            // 5% of PnL goes to platform
+            platformFeeSol = pnlSol * 0.05
+            // User gets currentValue minus fees
+            userPayoutSol = currentValueSol - creatorFeeSol - platformFeeSol
+        }
+        // If pnlSol <= 0, no fees taken, user just gets currentValueSol
+
+        console.info(TAG, 'closeLong fees', {
+            pnlSol, creatorFeeSol, platformFeeSol, userPayoutSol,
+            pnlPositive: pnlSol > 0
         })
+
+        // Add creator fee to vault's feesForCreator
+        if (creatorFeeSol > 0) {
+            const creatorFeeRef = db.ref(`/vaults/${vaultId}/feesForCreator`)
+            await creatorFeeRef.transaction((curr: any) => {
+                const cur = coerceNum(curr)
+                return cur + creatorFeeSol
+            })
+        }
+
+        // Add platform fee to treasury
+        if (platformFeeSol > 0) {
+            const platformRef = db.ref(`/platform/treasury/fees`)
+            await platformRef.transaction((curr: any) => {
+                const cur = coerceNum(curr)
+                return cur + platformFeeSol
+            })
+        }
+
+        // Credit user balance with payout (currentValue minus fees)
+        if (userPayoutSol > 0) {
+            const balanceRef = db.ref(`/users/${uid}/balance`)
+            await balanceRef.transaction((curr: any) => {
+                const cur = coerceNum(curr)
+                return cur + userPayoutSol
+            })
+        }
     }
 
-    // 9. Update position status to CLOSED
+    // 5. Update position status to CLOSED
     await db.ref(posPath).update({
         status: 'CLOSED',
         closedAt: now(),

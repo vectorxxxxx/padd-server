@@ -1632,9 +1632,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
           }
         }
       }
-      const { vaultId, mint, posId, uid: bodyUid, currentValueSol: bodyCurrentValueSol, markUsd: bodyMark } = req.body || {};
+      const { vaultId, mint, posId, uid: bodyUid, currentValueSol: bodyCurrentValueSol, markUsd: bodyMark, liquidated: bodyLiquidated } = req.body || {};
       // Support both vaultId (new) and mint (legacy) - vaultId takes precedence
       const resolvedVaultId = vaultId || mint;
+      const isLiquidation = bodyLiquidated === true;
 
       // If Firebase auth failed or wasn't provided, fall back to uid from body (wallet pubkey)
       if (!uid && bodyUid) {
@@ -1714,7 +1715,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Pass currentValueSol from frontend - this is the source of truth for PnL calculation
       const result = await engine.closeLong(uid, resolvedVaultId, posId, {
-        liquidated: false,
+        liquidated: isLiquidation,
         currentValueSol,
         solPriceUsd: solPriceUsd ?? undefined,
         markUsd: markUsd ?? undefined
